@@ -1,0 +1,80 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - '*'
+      - '**'
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: 'pages'
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: |
+          npm install --legacy-peer-deps --prefer-offline --no-audit
+
+      - name: Build Application
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          REPO_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
+          echo "Building application for repository: ${REPO_NAME}"
+          
+          # Build with base-href for GitHub Pages, fallback to standard build if flag error
+          npx ng build --configuration production --base-href "/${REPO_NAME}/" || npm run build
+          
+          # Auto-locate directory containing index.html in dist
+          INDEX_PATH=$(find dist -name "index.html" 2>/dev/null | head -n 1)
+          if [ -z "$INDEX_PATH" ]; then
+            echo "Error: index.html not found in dist/"
+            exit 1
+          fi
+          
+          BUILD_DIR=$(dirname "$INDEX_PATH")
+          echo "Found build output directory: ${BUILD_DIR}"
+          
+          # SPA routing support for GitHub Pages
+          cp "${BUILD_DIR}/index.html" "${BUILD_DIR}/404.html" || true
+          
+          # Bypass Jekyll processing
+          touch "${BUILD_DIR}/.nojekyll"
+          
+          echo "DEPLOY_PATH=${BUILD_DIR}" >> $GITHUB_ENV
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.DEPLOY_PATH }}
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

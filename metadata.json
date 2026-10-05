@@ -1,0 +1,6 @@
+{
+  "name": "Harvest Moon: Whispering Tree 3D",
+  "description": "3D Mobile Farming RPG terinspirasi Harvest Moon Tree of Tranquility khusus mobile web landscape dengan area switching, virtual joystick, dan kontrol all-in-one.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
