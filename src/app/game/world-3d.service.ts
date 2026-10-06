@@ -2,22 +2,28 @@ import { Injectable, inject } from '@angular/core';
 import * as THREE from 'three';
 import { ActionContext, AreaId } from '../models/game.models';
 import { CROP_CONFIGS, GameStateService } from '../services/game-state.service';
+import { AssetCacheService } from '../services/asset-cache.service';
+import { AudioService } from '../services/audio.service';
+import { VegetationChunkData, WorldEnvironmentBuilder } from './world-environment';
 import { WorldTexturesGenerator } from './world-textures';
-import { WorldEnvironmentBuilder } from './world-environment';
 
 @Injectable({
   providedIn: 'root'
 })
 export class World3dService {
   private gameState = inject(GameStateService);
+  private assetCache = inject(AssetCacheService);
+  private audio = inject(AudioService);
 
   private renderer!: THREE.WebGLRenderer;
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
   private container!: HTMLElement;
+  private terrainMesh?: THREE.Mesh;
 
-  // Animation & loop
+  // Animation & loop (Zero CPU when paused)
   private animFrameId: number | null = null;
+  private isLoopActive = false;
   private clock = new THREE.Clock();
 
   // Player 3D objects
@@ -44,6 +50,29 @@ export class World3dService {
   private interactiveMarkers: { pos: THREE.Vector3; radius: number; context: ActionContext }[] = [];
   private grassTuftMeshes: THREE.Group[] = [];
   private bushMeshes: THREE.Group[] = [];
+  private vegetationChunks: VegetationChunkData[] = [];
+  private cameraFrustum = new THREE.Frustum();
+  private projScreenMatrix = new THREE.Matrix4();
+  private lastVisibleChunkCount = -1;
+  private actionCheckTick = 0;
+
+  // Zero-allocation pre-cached vector/color objects for 60 FPS animation loop
+  private _tempSunColor = new THREE.Color();
+  private _tempAmbColor = new THREE.Color();
+  private _tempSkyColor = new THREE.Color();
+  private _tempFogColor = new THREE.Color();
+  private _tempSunPos = new THREE.Vector3();
+  private _colA = new THREE.Color();
+  private _colB = new THREE.Color();
+  private _cachedCamOffsetHouse = new THREE.Vector3(0, 7.8, 10.2);
+  private _cachedCamOffsetOutdoor = new THREE.Vector3(0, 10.5, 12.8);
+  private _cachedCamTarget = new THREE.Vector3();
+
+  // Tilt-Shift Miniature Shader & Pass (Authentic Diorama Blur)
+  private tiltShiftTarget?: THREE.WebGLRenderTarget;
+  private tiltShiftCamera?: THREE.OrthographicCamera;
+  private tiltShiftScene?: THREE.Scene;
+  private tiltShiftMaterial?: THREE.ShaderMaterial;
 
   // Windmill / Water animation elements
   private windmillBlades?: THREE.Group;
@@ -65,8 +94,23 @@ export class World3dService {
   private isSwingingTool = false;
   private swingProgress = 0;
 
+  // Photo Mode Camera Overrides
+  public photoFocus = new THREE.Vector3(0, 0, 0);
+  public photoDistance = 14.0;
+  public photoYaw = 0.0;     // radians
+  public photoPitch = 0.65;  // radians
+
+  // Dev Map Editor Properties
+  public terrainHeightOffsets = new Map<string, number>();
+  private devPlacedProps: { mesh: THREE.Object3D; type: string; x: number; z: number }[] = [];
+  private raycaster = new THREE.Raycaster();
+  private mouse = new THREE.Vector2();
+  private editorBrushRing?: THREE.Mesh;
+
   // Procedural Canvas Textures for Rich Visual Surfaces
   private grassTexture?: THREE.CanvasTexture;
+  private soilGroundTexture?: THREE.CanvasTexture;
+  private noiseTexture?: THREE.CanvasTexture;
   private roadTexture?: THREE.CanvasTexture;
   private roadEastTexture?: THREE.CanvasTexture;
   private townGroundTexture?: THREE.CanvasTexture;
@@ -82,12 +126,12 @@ export class World3dService {
     this.scene.background = new THREE.Color(0xdbebf5); // Morning sky pastel (06:26 AM)
     this.scene.fog = new THREE.FogExp2(0xdbebf5, 0.015); // Soft morning horizon haze
 
-    // 2. Camera: Classic Tree of Tranquility angle (38° tilt)
+    // 2. Camera: Authentic Harvest Moon: Tree of Tranquility 3/4 Isometric Perspective (32° FOV, ~39.4° elevation tilt)
     const aspect = canvasContainer.clientWidth / canvasContainer.clientHeight;
     // Set near plane to 0.8m to eliminate Z-buffer precision loss and surface fighting
-    this.camera = new THREE.PerspectiveCamera(46, aspect, 0.8, 120);
-    this.camera.position.set(0, 8.5, 9.5);
-    this.camera.lookAt(0, 1.0, 0);
+    this.camera = new THREE.PerspectiveCamera(32, aspect, 0.8, 140);
+    this.camera.position.set(0, 10.5, 12.8);
+    this.camera.lookAt(0, 0.85, 0);
 
     // 3. Renderer with High-Precision Depth Buffer & Real-time Soft Shadow Map
     this.renderer = new THREE.WebGLRenderer({
@@ -97,11 +141,11 @@ export class World3dService {
       precision: 'highp',
       preserveDrawingBuffer: true
     });
-    // Clamp pixel ratio to max 1.25 to prevent low-end mobile thermal choking
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+    // Clamp pixel ratio to max 1.0 on mobile to guarantee smooth 60 FPS fill-rate
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.0));
     this.renderer.setSize(canvasContainer.clientWidth, canvasContainer.clientHeight);
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     canvasContainer.innerHTML = '';
     canvasContainer.appendChild(this.renderer.domElement);
@@ -134,26 +178,31 @@ export class World3dService {
     this.hemiLight.position.set(0, 30, 0);
     this.scene.add(this.hemiLight);
 
-    // Directional Sun Light with Warm Morning Sun Color (0xfff0dd) & Low Angle
+    // Directional Sun Light with Precision Focused Shadow Camera (High Resolution & Normal-Biased to eliminate Shadow Acne)
     this.sunLight = new THREE.DirectionalLight(0xfff0dd, 1.18);
     this.sunLight.position.set(22, 7.5, 14); // Low morning sun angle
     this.sunLight.castShadow = true;
     this.sunLight.shadow.mapSize.width = 1024;
     this.sunLight.shadow.mapSize.height = 1024;
-    this.sunLight.shadow.camera.near = 0.5;
-    this.sunLight.shadow.camera.far = 65;
-    this.sunLight.shadow.camera.left = -16;
-    this.sunLight.shadow.camera.right = 16;
-    this.sunLight.shadow.camera.top = 16;
-    this.sunLight.shadow.camera.bottom = -16;
-    this.sunLight.shadow.bias = -0.0004;
-    this.sunLight.shadow.normalBias = 0.02;
-    this.sunLight.shadow.radius = 1.5;
+    this.sunLight.shadow.camera.near = 1.0;
+    this.sunLight.shadow.camera.far = 45;
+    // Precision shadow camera: tightly bounds the camera's fixed viewing box (20x20m around target)
+    this.sunLight.shadow.camera.left = -10.5;
+    this.sunLight.shadow.camera.right = 10.5;
+    this.sunLight.shadow.camera.top = 10.5;
+    this.sunLight.shadow.camera.bottom = -10.5;
+    this.sunLight.shadow.camera.updateProjectionMatrix();
+    this.sunLight.shadow.bias = -0.0001;
+    this.sunLight.shadow.normalBias = 0.06; // Offsets shadow along surface normal to eliminate self-shadowing acne
+    this.sunLight.shadow.radius = 1.8; // Smooth soft anti-aliased shadow borders
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
 
     // Initial atmospheric lighting pass based on in-game clock (e.g. 06:38 AM)
     this.updateAtmosphericLighting();
+
+    // Initialize Tilt-Shift Miniature Pass (Authentic Aesthetic Diorama Blur)
+    this.initTiltShiftPass(canvasContainer.clientWidth, canvasContainer.clientHeight);
 
     // 5. Add Area group & Player group
     this.scene.add(this.areaGroup);
@@ -163,10 +212,107 @@ export class World3dService {
     this.buildCurrentArea(this.gameState.currentArea());
 
     // 7. Start render loop
-    this.animate();
+    this.resumeLoop();
 
     // 8. Handle resize
     window.addEventListener('resize', this.onWindowResize);
+  }
+
+  public pauseLoop(): void {
+    if (this.animFrameId !== null) {
+      cancelAnimationFrame(this.animFrameId);
+      this.animFrameId = null;
+    }
+    this.isLoopActive = false;
+    this.gameState.isGamePaused.set(true);
+  }
+
+  public resumeLoop(): void {
+    if (this.isLoopActive) return;
+    this.isLoopActive = true;
+    this.gameState.isGamePaused.set(false);
+    this.clock.start();
+    this.lastFrameTime = performance.now();
+    this.lastFpsUpdateTime = performance.now();
+    this.frameCount = 0;
+    this.animate();
+  }
+
+  public isLoopRunning(): boolean {
+    return this.isLoopActive;
+  }
+
+  private initTiltShiftPass(width: number, height: number): void {
+    if (this.tiltShiftTarget) {
+      this.tiltShiftTarget.dispose();
+    }
+
+    this.tiltShiftTarget = new THREE.WebGLRenderTarget(width, height, {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      format: THREE.RGBAFormat
+    });
+
+    this.tiltShiftCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.tiltShiftScene = new THREE.Scene();
+
+    this.tiltShiftMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: this.tiltShiftTarget.texture },
+        uResolution: { value: new THREE.Vector2(width, height) },
+        uFocusY: { value: 0.52 },
+        uFocusRange: { value: 0.28 },
+        uBlurAmount: { value: 1.0 }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform vec2 uResolution;
+        uniform float uFocusY;
+        uniform float uFocusRange;
+        uniform float uBlurAmount;
+        varying vec2 vUv;
+
+        void main() {
+          float dist = abs(vUv.y - uFocusY);
+          float blurFactor = smoothstep(uFocusRange, 0.50, dist) * uBlurAmount;
+
+          // Zero-cost early return in the focal area (character, crops, animals)
+          if (blurFactor < 0.01) {
+            gl_FragColor = texture2D(tDiffuse, vUv);
+            return;
+          }
+
+          // 9-tap vertical-weighted bokeh blur for tilt-shift miniature style
+          vec2 texel = vec2(0.0, 1.0 / uResolution.y) * blurFactor * 3.2;
+          vec4 col = vec4(0.0);
+          col += texture2D(tDiffuse, vUv - texel * 4.0) * 0.05;
+          col += texture2D(tDiffuse, vUv - texel * 3.0) * 0.09;
+          col += texture2D(tDiffuse, vUv - texel * 2.0) * 0.12;
+          col += texture2D(tDiffuse, vUv - texel * 1.0) * 0.15;
+          col += texture2D(tDiffuse, vUv) * 0.18;
+          col += texture2D(tDiffuse, vUv + texel * 1.0) * 0.15;
+          col += texture2D(tDiffuse, vUv + texel * 2.0) * 0.12;
+          col += texture2D(tDiffuse, vUv + texel * 3.0) * 0.09;
+          col += texture2D(tDiffuse, vUv + texel * 4.0) * 0.05;
+
+          // Subtle miniature contrast & saturation boost on peripheral blur
+          col.rgb = mix(col.rgb, col.rgb * 1.05, blurFactor * 0.35);
+          gl_FragColor = col;
+        }
+      `,
+      depthTest: false,
+      depthWrite: false
+    });
+
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.tiltShiftMaterial);
+    this.tiltShiftScene.add(quad);
   }
 
   private onWindowResize = (): void => {
@@ -175,15 +321,21 @@ export class World3dService {
     const h = this.container.clientHeight;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.0));
     this.renderer.setSize(w, h);
+
+    if (this.tiltShiftTarget && this.tiltShiftMaterial) {
+      this.tiltShiftTarget.setSize(w, h);
+      this.tiltShiftMaterial.uniforms['uResolution'].value.set(w, h);
+    }
   };
 
   public destroy(): void {
-    if (this.animFrameId !== null) {
-      cancelAnimationFrame(this.animFrameId);
-    }
+    this.pauseLoop();
     window.removeEventListener('resize', this.onWindowResize);
+    if (this.tiltShiftTarget) {
+      this.tiltShiftTarget.dispose();
+    }
     if (this.renderer) {
       this.renderer.dispose();
     }
@@ -205,6 +357,9 @@ export class World3dService {
     this.interactiveMarkers = [];
     this.grassTuftMeshes = [];
     this.bushMeshes = [];
+    this.vegetationChunks = [];
+    this.gameState.totalChunks.set(0);
+    this.gameState.visibleChunks.set(0);
 
     // Adjust sky/fog based on area
     if (area === 'house' || area === 'shop') {
@@ -250,10 +405,9 @@ export class World3dService {
     });
   }
 
-  // CONTINUOUS SMOOTH TERRAIN ELEVATION (Anti-Boxy, Smooth Rolling Hills)
-  public getFarmHeight(x: number, z: number): number {
-    // 1. Strict Flat Mask for Crop Field (petak tanam tetap rata sempurna)
-    // Plots span x: [3.5, 9.5], z: [4.0, 8.5]
+  // CONTINUOUS SMOOTH TERRAIN ELEVATION (Un-carved Base Hill Height)
+  public getTerrainBaseHeight(x: number, z: number): number {
+    // 1. Strict Flat Mask for Crop Field
     const fieldMinX = 2.4;
     const fieldMaxX = 10.6;
     const fieldMinZ = 2.8;
@@ -261,9 +415,6 @@ export class World3dService {
     const fdx = Math.max(0, Math.max(fieldMinX - x, x - fieldMaxX));
     const fdz = Math.max(0, Math.max(fieldMinZ - z, z - fieldMaxZ));
     const distField = Math.hypot(fdx, fdz);
-
-    // Quintic Hermite curve: zero 1st and 2nd derivatives at borders
-    // Guarantees zero step, zero crease, and pure organic rounded transition!
     const blendFieldDist = 4.2;
     const ft = Math.min(1, Math.max(0, distField / blendFieldDist));
     const smoothField = ft * ft * ft * (10 - 15 * ft + 6 * ft * ft);
@@ -281,83 +432,155 @@ export class World3dService {
 
     let h = 0;
 
-    // A. North Mountain Ascent (bukit jalan menanjak ke arah Whispering Mother Tree & North Backdrop)
-    // Ascends smoothly from z = -2.0 to z = -36.0, reaching up to +10.9m at northern peak
+    // River channel mask (clears out hill bumps inside river path using new gentle S-curve)
+    const riverX = 21.0 + Math.sin(z * 0.08) * 1.8;
+    const distRiver = Math.abs(x - riverX);
+    let riverPass = 1.0;
+    if (distRiver < 3.8) {
+      riverPass = Math.min(1.0, distRiver / 3.8);
+      riverPass = riverPass * riverPass * (3.0 - 2.0 * riverPass);
+    }
+
+    // A. North Mountain Ascent (Allowed to rise naturally with the river flowing up it)
     if (z < -2.0) {
       const nz = Math.abs(z - (-2.0));
       const nt = Math.min(1, nz / 30.0);
-      // Smooth continuous mountain rise (smooth cubic ease)
       h += nt * nt * (3.0 - 1.1 * nt) * 5.8;
       if (z < -26.0) {
         const extraN = Math.abs(z - (-26.0)) / 10.0;
-        h += extraN * extraN * 5.1; // Seamlessly connects terrain with Mountain Backdrop (Y = 10.9)
+        h += extraN * extraN * 5.1;
       }
     }
 
-    // Outer Boundary Wall Elevations (Sisi Selatan, Timur & Barat)
+    // Outer Boundary Wall Elevations (River cuts through south boundary wall)
     if (z > 26.0) {
       const extraS = (z - 26.0) / 10.0;
-      h += extraS * extraS * 3.8; // South cliff wall elevation
+      h += extraS * extraS * 3.8 * riverPass;
     }
     if (Math.abs(x) > 26.0) {
       const extraX = (Math.abs(x) - 26.0) / 10.0;
-      h += extraX * extraX * 2.8; // West & East forest ridge elevation
+      h += extraX * extraX * 2.8;
     }
 
-    // B. North-East Windmill Hill Terrace (bukit kincir angin dengan lereng membulat halus)
+    // B. North-East Windmill Hill Terrace
     const wmDist = Math.hypot(x - 22.0, z - (-16.0));
     if (wmDist < 19.0) {
       const wt = 1.0 - wmDist / 19.0;
-      // Dome elevation up to 4.8m
-      h += wt * wt * wt * (10 - 15 * wt + 6 * wt * wt) * 4.8;
+      h += wt * wt * wt * (10 - 15 * wt + 6 * wt * wt) * 4.8 * (0.2 + 0.8 * riverPass);
     }
 
-    // C. South Scenic Bluff / Ocean Lookout Hill (bukit panorama selatan menanjak)
+    // C. South Scenic Bluff / Ocean Lookout Hill (River channel passes cleanly through south bluff)
     const sDist = Math.hypot(x - 20.0, z - 22.0);
     if (sDist < 17.0) {
       const st = 1.0 - sDist / 17.0;
-      h += st * st * (3.0 - 2.0 * st) * 3.6;
+      h += st * st * (3.0 - 2.0 * st) * 3.6 * riverPass;
     }
 
-    // D. South-West Rolling Ridge (lereng padang rumput barat daya)
+    // D. South-West Rolling Ridge
     const swDist = Math.hypot(x - (-22.0), z - 20.0);
     if (swDist < 16.0) {
       const swt = 1.0 - swDist / 16.0;
       h += swt * swt * (3.0 - 2.0 * swt) * 3.2;
     }
 
-    // E. West Pasture Rolling Knolls (padang rumput peternakan berkontur alami)
+    // E. West Pasture Rolling Knolls
     const pDist = Math.hypot(x - (-19.0), z - (-2.0));
     if (pDist < 17.0) {
       const pt = 1.0 - pDist / 17.0;
       h += pt * pt * (3.0 - 2.0 * pt) * 2.2;
     }
 
-    // F. North-West Forest Foothills (lereng hutan pinus barat laut)
+    // F. North-West Forest Foothills
     const nwDist = Math.hypot(x - (-20.0), z - (-20.0));
     if (nwDist < 18.0) {
       const nwt = 1.0 - nwDist / 18.0;
       h += nwt * nwt * (3.0 - 2.0 * nwt) * 4.2;
     }
 
-    // G. Natural Organic Undulation across open grass (permukaan tanah tidak rata & bergelombang alami)
-    // Non-repeating multiple harmonic organic waves
-    h += Math.sin(x * 0.14 + 0.3) * Math.cos(z * 0.12) * 0.42;
-    h += Math.sin(x * 0.28 - z * 0.22 + 1.1) * 0.26;
-    h += Math.cos(x * 0.08 + z * 0.16) * 0.32;
-    h += Math.sin(x * 0.45 + z * 0.38) * 0.14;
+    // G. Natural Organic Undulation (Cleared inside river path)
+    let undulation = Math.sin(x * 0.14 + 0.3) * Math.cos(z * 0.12) * 0.42;
+    undulation += Math.sin(x * 0.28 - z * 0.22 + 1.1) * 0.26;
+    undulation += Math.cos(x * 0.08 + z * 0.16) * 0.32;
+    undulation += Math.sin(x * 0.45 + z * 0.38) * 0.14;
+    h += undulation * riverPass;
 
-    // Apply strict flat masks so only petak tanam and house entrance remain completely flat
     h = h * smoothField * smoothHouse;
-
     return Math.max(0, h);
+  }
+
+  // 1. RAW TERRAIN ELEVATION (Base Hills + Riverbed Carving, NO Bridges)
+  public getTerrainHeight(x: number, z: number): number {
+    let baseH = this.getTerrainBaseHeight(x, z);
+
+    // Apply custom dev height offsets if any
+    const gridKey = `${Math.round(x)},${Math.round(z)}`;
+    const offset = this.terrainHeightOffsets.get(gridKey) || 0;
+    baseH += offset;
+
+    // Gentle S-curve river path formula
+    const riverX = 21.0 + Math.sin(z * 0.08) * 1.8;
+    const distToRiver = Math.abs(x - riverX);
+    const riverBedWidth = 1.4; // 2.8m wide flat riverbed floor
+    const bankWidth = 2.8;     // 5.6m total channel span to outer bank
+
+    if (distToRiver < bankWidth && z > -36 && z < 36) {
+      const riverCenterBaseY = this.getTerrainBaseHeight(riverX, z) + (this.terrainHeightOffsets.get(`${Math.round(riverX)},${Math.round(z)}`) || 0);
+      const bedY = riverCenterBaseY - 0.50;
+
+      if (distToRiver <= riverBedWidth) {
+        // Flat riverbed floor consistently 0.50m below river center height
+        return bedY;
+      } else {
+        // Smooth bank slope transitioning from riverbed floor (bedY) up to surrounding land (baseH)
+        const t = (distToRiver - riverBedWidth) / (bankWidth - riverBedWidth);
+        const smoothT = t * t * (3.0 - 2.0 * t);
+        return bedY + (baseH - bedY) * smoothT;
+      }
+    }
+
+    return baseH;
+  }
+
+  // 2. INTERACTIVE PLAYER HEIGHT (Terrain Height + Bridge Deck Overrides)
+  public getFarmHeight(x: number, z: number): number {
+    const terrainH = this.getTerrainHeight(x, z);
+
+    // 1. East Road Main Wooden Arch Bridge Deck (x ≈ 21.0, z ≈ 0.0)
+    const distBridge1X = Math.abs(x - 21.0);
+    const distBridge1Z = Math.abs(z - 0.0);
+    if (distBridge1X < 3.1 && distBridge1Z < 1.6) {
+      // Clean arch deck spanning from x = 17.9 to x = 24.1
+      const t = (x - 17.9) / 6.2; // 0 to 1 across the bridge width
+      const bankLeftY = this.getTerrainBaseHeight(17.9, z);
+      const bankRightY = this.getTerrainBaseHeight(24.1, z);
+      const baseY = bankLeftY + t * (bankRightY - bankLeftY);
+      
+      // Add a nice arch (0.42m peak in the center)
+      const archY = baseY + 0.42 * 4.0 * t * (1.0 - t);
+      
+      // Blend deck height at the Z-edges (Z width of 1.6m) to transition smoothly
+      const zBlend = 1.0 - distBridge1Z / 1.6;
+      return Math.max(terrainH, archY * zBlend + terrainH * (1.0 - zBlend));
+    }
+
+    // 2. High North Mountain Canyon Footbridge Deck (x ≈ 19.5, z ≈ -12.5, Y ≈ 6.2m)
+    const distBridge2X = Math.abs(x - 19.5);
+    const distBridge2Z = Math.abs(z - (-12.5));
+    if (distBridge2X < 4.4 && distBridge2Z < 1.4) {
+      const westCliffY = this.getTerrainBaseHeight(15.2, -12.5);
+      const eastCliffY = this.getTerrainBaseHeight(23.8, -12.5);
+      const highDeckY = Math.max(westCliffY, eastCliffY) + 0.12;
+      return highDeckY;
+    }
+
+    return terrainH;
   }
 
   // AREA 1: SOLARIA FARMSTEAD (EXPANDED & ROLLING SMOOTH HILLS)
   private buildFarmsteadArea(): void {
-    // 1. High-Density Smooth Terrain Mesh with Multi-Biome Organic Ground Shading (Meadow, Earth, Stone)
+    // 1. High-Density Smooth Terrain Mesh with Multi-Biome Organic Ground Shading
     const terrainSize = 92;
-    const terrainSegs = 90;
+    const terrainSegs = 80; // High resolution for smooth riverbank channels
     const groundGeo = new THREE.PlaneGeometry(terrainSize, terrainSize, terrainSegs, terrainSegs);
     groundGeo.rotateX(-Math.PI / 2); // Make XZ plane with +Y up
 
@@ -366,124 +589,28 @@ export class World3dService {
     for (let i = 0; i < posAttr.count; i++) {
       const vx = posAttr.getX(i);
       const vz = posAttr.getZ(i);
-      const vy = this.getFarmHeight(vx, vz);
+      const vy = this.getTerrainHeight(vx, vz);
       posAttr.setY(i, vy);
 
-      // A. Multi-frequency Biome Noise for Meadow Grass Variegation
-      const nMeadow = Math.sin(vx * 0.055) * Math.cos(vz * 0.055);
-      const nMeadowFine = Math.sin(vx * 0.16 + 1.8) * Math.cos(vz * 0.15 - 1.2) * 0.5;
-      const nEarth = Math.sin(vx * 0.13 + 1.2) * Math.cos(vz * 0.12 - 0.7) + Math.sin(vx * 0.06 - vz * 0.08) * 0.5;
-      const nStone = Math.sin(vx * 0.22 - 0.5) * Math.cos(vz * 0.24 + 1.1) * 0.5;
-
-      // Micro-Noise Grass Variation (Sun-dappled lime, spring clover, and golden meadow tones)
-      const microNoise = Math.sin(vx * 0.85 + vz * 0.65) * 0.05 + Math.cos(vx * 1.5 - vz * 1.3) * 0.035;
-
-      // Base Grass Green tones: Deep lush clover (#3b8c20), warm meadow (#58ad28), sunny golden lime (#7ecf38)
-      let r = 0.35 + nMeadow * 0.10 + nMeadowFine * 0.06 + microNoise * 0.5;
-      let g = 0.68 + nMeadow * 0.12 + nMeadowFine * 0.08 + microNoise * 0.6;
-      let b = 0.18 + nMeadow * 0.05 + nMeadowFine * 0.03 + microNoise * 0.2;
-
-      // B. Organic Exposed Earth / Sandy Loam Patches with Feathered Grass Fleck Dither
-      if (nEarth > 0.18) {
-        // High-frequency grass dither noise for soft organic transition without sharp straight cuts
-        const noiseFleck = Math.sin(vx * 2.8 + vz * 3.2) * 0.16 + Math.cos(vx * 4.2 - vz * 3.8) * 0.10;
-        let earthBlend = Math.min(1, (nEarth - 0.18) / 0.45);
-        earthBlend = Math.max(0, Math.min(1, earthBlend + noiseFleck));
-
-        const earthR = 0.68;
-        const earthG = 0.50;
-        const earthB = 0.30;
-        r = r * (1 - earthBlend) + earthR * earthBlend;
-        g = g * (1 - earthBlend) + earthG * earthBlend;
-        b = b * (1 - earthBlend) + earthB * earthBlend;
-      }
-
-      // Natural soft earth tint along path borders (subtle feathering under road edges)
-      const distCross = Math.hypot(vx, vz - 1.0);
-      const distNorthPath = Math.abs(vx);
-      const distEastPath = Math.abs(vz);
-      if (distCross < 3.2) {
-        const crossBlend = (1.0 - distCross / 3.2) * 0.4;
-        r = r * (1 - crossBlend) + 0.65 * crossBlend;
-        g = g * (1 - crossBlend) + 0.50 * crossBlend;
-        b = b * (1 - crossBlend) + 0.32 * crossBlend;
-      }
-      if (distNorthPath < 2.4 && vz < 0 && vz > -31.0) {
-        const pathBlend = (1.0 - distNorthPath / 2.4) * 0.35;
-        r = r * (1 - pathBlend) + 0.62 * pathBlend;
-        g = g * (1 - pathBlend) + 0.48 * pathBlend;
-        b = b * (1 - pathBlend) + 0.32 * pathBlend;
-      }
-      if (distEastPath < 2.4 && vx > 0 && vx < 31.0) {
-        const pathBlend = (1.0 - distEastPath / 2.4) * 0.35;
-        r = r * (1 - pathBlend) + 0.62 * pathBlend;
-        g = g * (1 - pathBlend) + 0.48 * pathBlend;
-        b = b * (1 - pathBlend) + 0.32 * pathBlend;
-      }
-
-      // C. High Slopes & Rocky Ridge Tints + Valley/Ceruk Shadowing (Ilusi Kedalaman Alami)
-      if (vy > 0.15 && vy < 3.2) {
-        // Darken terrain in valley/ceruk areas at slope foot transitions
-        const valleyFactor = 0.74 + 0.26 * Math.min(1.0, Math.abs(vy - 1.2) / 1.5);
-        r *= valleyFactor;
-        g *= valleyFactor;
-        b *= valleyFactor;
-      }
-
-      if (vy > 1.6) {
-        const slopeBlend = Math.min(0.70, (vy - 1.6) / 3.8 + nStone * 0.22);
-        if (slopeBlend > 0) {
-          const stoneR = 0.52;
-          const stoneG = 0.56;
-          const stoneB = 0.50;
-          r = r * (1 - slopeBlend) + stoneR * slopeBlend;
-          g = g * (1 - slopeBlend) + stoneG * slopeBlend;
-          b = b * (1 - slopeBlend) + stoneB * slopeBlend;
-        }
-      }
-
-      // D. Vertex Ambient Occlusion (Gentle contact darkening near base of buildings & edges)
-      const distHouse = Math.hypot(vx, vz - (-4.5));
-      if (distHouse < 5.0) {
-        const aoFactor = 0.80 + 0.20 * (distHouse / 5.0);
-        r *= aoFactor;
-        g *= aoFactor;
-        b *= aoFactor;
-      }
-
-      const distBarn = Math.hypot(vx - (-18.0), vz - 2.0);
-      if (distBarn < 5.5) {
-        const aoFactor = 0.80 + 0.20 * (distBarn / 5.5);
-        r *= aoFactor;
-        g *= aoFactor;
-        b *= aoFactor;
-      }
-
-      const distWindmill = Math.hypot(vx - 22.0, vz - (-16.0));
-      if (distWindmill < 4.0) {
-        const aoFactor = 0.82 + 0.18 * (distWindmill / 4.0);
-        r *= aoFactor;
-        g *= aoFactor;
-        b *= aoFactor;
-      }
-
-      colors.push(r, g, b);
+      // 100% pure uniform baseline - eliminates per-vertex Gouraud diagonal tessellation stripes
+      colors.push(1.0, 1.0, 1.0);
     }
     groundGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    groundGeo.computeVertexNormals(); // Silky smooth lighting, completely anti-boxy!
+    groundGeo.computeVertexNormals();
 
-    const groundMat = new THREE.MeshLambertMaterial({
-      map: this.grassTexture,
-      vertexColors: true,
-      flatShading: false
+    const groundMat = WorldEnvironmentBuilder.createOrganicTerrainMaterial({
+      grassTexture: this.grassTexture,
+      soilTexture: this.soilGroundTexture,
+      noiseTexture: this.noiseTexture,
+      tilingScale: 0.12
     });
-    const ground = new THREE.Mesh(groundGeo, groundMat);
-    ground.receiveShadow = true;
-    ground.renderOrder = 0;
-    this.areaGroup.add(ground);
+    this.terrainMesh = new THREE.Mesh(groundGeo, groundMat);
+    this.terrainMesh.receiveShadow = true;
+    this.terrainMesh.renderOrder = 0;
+    this.areaGroup.add(this.terrainMesh);
 
     // 2. Smooth Conforming Cobblestone & Dirt Roads with Feathered Alpha Blending (Seamless Grass Transition)
-    const roadElevation = 0.065;
+    const roadElevation = 0.09;
     const pathMat = new THREE.MeshLambertMaterial({
       map: this.roadTexture,
       color: 0xffffff,
@@ -492,8 +619,9 @@ export class World3dService {
       depthTest: true,
       depthWrite: false,
       polygonOffset: true,
-      polygonOffsetFactor: -2.0,
-      polygonOffsetUnits: -4.0
+      polygonOffsetFactor: -3.0,
+      polygonOffsetUnits: -6.0,
+      side: THREE.FrontSide
     });
 
     const pathEastMat = new THREE.MeshLambertMaterial({
@@ -505,7 +633,8 @@ export class World3dService {
       depthWrite: false,
       polygonOffset: true,
       polygonOffsetFactor: -2.0,
-      polygonOffsetUnits: -4.0
+      polygonOffsetUnits: -4.0,
+      side: THREE.FrontSide
     });
 
     // A. Central Farmstead Crossroads Pad (Seamless Junction with Zero Overlap)
@@ -519,10 +648,6 @@ export class World3dService {
       cPos.setY(i, this.getFarmHeight(px, pz) + roadElevation);
     }
     crossRoadGeo.computeVertexNormals();
-    const crossMesh = new THREE.Mesh(crossRoadGeo, pathMat);
-    crossMesh.receiveShadow = true;
-    crossMesh.renderOrder = 2;
-    this.areaGroup.add(crossMesh);
 
     // B. North Climbing Mountain Road (Extended past tree line to z = -37.5 with perspective tapering)
     const northRoadGeo = new THREE.PlaneGeometry(3.2, 36.0, 4, 60);
@@ -548,10 +673,6 @@ export class World3dService {
       nUvs.setXY(i, u, v);
     }
     northRoadGeo.computeVertexNormals();
-    const northMesh = new THREE.Mesh(northRoadGeo, pathMat);
-    northMesh.receiveShadow = true;
-    northMesh.renderOrder = 2;
-    this.areaGroup.add(northMesh);
 
     // C. East Road towards Harmonica Town (Extended past tree line to x = 37.5 with perspective tapering)
     const eastRoadGeo = new THREE.PlaneGeometry(36.1, 3.2, 60, 4);
@@ -581,68 +702,80 @@ export class World3dService {
     eastMesh.renderOrder = 2;
     this.areaGroup.add(eastMesh);
 
-    // D. Winding Climbing Path to Windmill Hill (branches cleanly off East Road at x = 3.5)
-    const wmCurve = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(3.5, 0, 0),
-      new THREE.Vector3(8.0, 0, -3.5),
-      new THREE.Vector3(13.0, 0, -8.0),
-      new THREE.Vector3(17.5, 0, -12.0),
-      new THREE.Vector3(21.5, 0, -15.5)
-    ]);
-    const wmPoints = wmCurve.getPoints(36);
-    const wmVertices: number[] = [];
-    const wmUvs: number[] = [];
-    const wmIndices: number[] = [];
+    // D. Winding Climbing Path to Windmill Hill (West Bank approach to North Footbridge)
+    const createRibbonRoadGeo = (points: THREE.Vector3[], width: number, elev: number) => {
+      const vertices: number[] = [];
+      const uvs: number[] = [];
+      const indices: number[] = [];
+      let cumulativeDist = 0;
+      const subSegments = 4; // Subdivide road width into 4 strips to perfectly hug hill contours
+
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        let tangent = new THREE.Vector3(1, 0, 0);
+        if (i < points.length - 1) {
+          tangent = points[i + 1].clone().sub(p).normalize();
+          if (i > 0) cumulativeDist += p.distanceTo(points[i - 1]);
+        } else {
+          tangent = p.clone().sub(points[i - 1]).normalize();
+          cumulativeDist += p.distanceTo(points[i - 1]);
+        }
+        const unitNormal = new THREE.Vector3(-tangent.z, 0, tangent.x).normalize();
+        const v = cumulativeDist / 2.6;
+
+        for (let j = 0; j <= subSegments; j++) {
+          const u = j / subSegments; // 0.0, 0.25, 0.5, 0.75, 1.0
+          const offsetFactor = (u - 0.5) * width;
+          const vx = p.x + unitNormal.x * offsetFactor;
+          const vz = p.z + unitNormal.z * offsetFactor;
+          const vy = this.getFarmHeight(vx, vz) + elev;
+
+          vertices.push(vx, vy, vz);
+          uvs.push(u, v);
+        }
+
+        if (i < points.length - 1) {
+          const rowStride = subSegments + 1;
+          const baseIdx = i * rowStride;
+          const nextIdx = (i + 1) * rowStride;
+
+          for (let j = 0; j < subSegments; j++) {
+            const current = baseIdx + j;
+            const next = nextIdx + j;
+            indices.push(current, current + 1, next);
+            indices.push(current + 1, next + 1, next);
+          }
+        }
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+      return geo;
+    };
+
     const roadWidth = 2.8;
 
-    let cumulativeWmDist = 0;
-    for (let i = 0; i < wmPoints.length; i++) {
-      const p = wmPoints[i];
-      let tangent = new THREE.Vector3(1, 0, 0);
-      if (i < wmPoints.length - 1) {
-        tangent = wmPoints[i + 1].clone().sub(p).normalize();
-        if (i > 0) {
-          cumulativeWmDist += p.distanceTo(wmPoints[i - 1]);
-        }
-      } else {
-        tangent = p.clone().sub(wmPoints[i - 1]).normalize();
-        cumulativeWmDist += p.distanceTo(wmPoints[i - 1]);
-      }
-      const normal = new THREE.Vector3(-tangent.z, 0, tangent.x).normalize().multiplyScalar(roadWidth * 0.5);
+    // West Bank Path leading cleanly into West Entrance of High Canyon Bridge (x = 15.2, z = -12.5)
+    const wmWestCurve = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(3.5, 0, 0),
+      new THREE.Vector3(7.5, 0, -3.5),
+      new THREE.Vector3(11.5, 0, -7.5),
+      new THREE.Vector3(15.2, 0, -12.5)
+    ]);
+    const wmRoadGeo = createRibbonRoadGeo(wmWestCurve.getPoints(28), roadWidth, roadElevation);
 
-      const leftX = p.x - normal.x;
-      const leftZ = p.z - normal.z;
-      const leftY = this.getFarmHeight(leftX, leftZ) + roadElevation;
+    // East Bank Path continuing from East Exit of High Canyon Bridge (x = 23.8, z = -12.5) up Windmill Hill
+    const wmEastCurve = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(23.8, 0, -12.5),
+      new THREE.Vector3(25.5, 0, -15.5),
+      new THREE.Vector3(27.0, 0, -18.5)
+    ]);
+    const wmEastRoadGeo = createRibbonRoadGeo(wmEastCurve.getPoints(20), roadWidth, roadElevation);
 
-      const rightX = p.x + normal.x;
-      const rightZ = p.z + normal.z;
-      const rightY = this.getFarmHeight(rightX, rightZ) + roadElevation;
-
-      wmVertices.push(leftX, leftY, leftZ);
-      wmVertices.push(rightX, rightY, rightZ);
-
-      const v = cumulativeWmDist / 2.6;
-      wmUvs.push(0, v);
-      wmUvs.push(1, v);
-
-      if (i < wmPoints.length - 1) {
-        const base = i * 2;
-        wmIndices.push(base, base + 1, base + 2);
-        wmIndices.push(base + 1, base + 3, base + 2);
-      }
-    }
-
-    const wmRoadGeo = new THREE.BufferGeometry();
-    wmRoadGeo.setAttribute('position', new THREE.Float32BufferAttribute(wmVertices, 3));
-    wmRoadGeo.setAttribute('uv', new THREE.Float32BufferAttribute(wmUvs, 2));
-    wmRoadGeo.setIndex(wmIndices);
-    wmRoadGeo.computeVertexNormals();
-    const wmMesh = new THREE.Mesh(wmRoadGeo, pathMat);
-    wmMesh.receiveShadow = true;
-    wmMesh.renderOrder = 2;
-    this.areaGroup.add(wmMesh);
-
-    // E. Scenic Climbing Path to South Lookout Bluff (routed cleanly around the crop field perimeter with generous clearance)
+    // E. Scenic Climbing Path to South Lookout Bluff
     const sCurve = new THREE.CatmullRomCurve3([
       new THREE.Vector3(0, 0, 3.5),
       new THREE.Vector3(-0.2, 0, 7.5),
@@ -651,72 +784,25 @@ export class World3dService {
       new THREE.Vector3(10.5, 0, 17.5),
       new THREE.Vector3(18.5, 0, 21.0)
     ]);
-    const sPoints = sCurve.getPoints(32);
-    const sVertices: number[] = [];
-    const sUvs: number[] = [];
-    const sIndices: number[] = [];
+    const sRoadGeo = createRibbonRoadGeo(sCurve.getPoints(32), roadWidth, roadElevation);
 
-    let cumulativeSDist = 0;
-    for (let i = 0; i < sPoints.length; i++) {
-      const p = sPoints[i];
-      let tangent = new THREE.Vector3(1, 0, 0);
-      if (i < sPoints.length - 1) {
-        tangent = sPoints[i + 1].clone().sub(p).normalize();
-        if (i > 0) {
-          cumulativeSDist += p.distanceTo(sPoints[i - 1]);
-        }
-      } else {
-        tangent = p.clone().sub(sPoints[i - 1]).normalize();
-        cumulativeSDist += p.distanceTo(sPoints[i - 1]);
-      }
-      const normal = new THREE.Vector3(-tangent.z, 0, tangent.x).normalize().multiplyScalar(roadWidth * 0.5);
+    // Merge static continuous roads into 1 single mesh (Massive Draw Call Reduction)
+    const mergedRoadGeo = WorldEnvironmentBuilder.safeMergeGeometries([crossRoadGeo, northRoadGeo, wmRoadGeo, wmEastRoadGeo, sRoadGeo], false);
+    const mergedRoadMesh = new THREE.Mesh(mergedRoadGeo, pathMat);
+    mergedRoadMesh.receiveShadow = true;
+    mergedRoadMesh.renderOrder = 2;
+    this.areaGroup.add(mergedRoadMesh);
 
-      const leftX = p.x - normal.x;
-      const leftZ = p.z - normal.z;
-      const leftY = this.getFarmHeight(leftX, leftZ) + roadElevation;
-
-      const rightX = p.x + normal.x;
-      const rightZ = p.z + normal.z;
-      const rightY = this.getFarmHeight(rightX, rightZ) + roadElevation;
-
-      sVertices.push(leftX, leftY, leftZ);
-      sVertices.push(rightX, rightY, rightZ);
-
-      const v = cumulativeSDist / 2.6;
-      sUvs.push(0, v);
-      sUvs.push(1, v);
-
-      if (i < sPoints.length - 1) {
-        const base = i * 2;
-        sIndices.push(base, base + 1, base + 2);
-        sIndices.push(base + 1, base + 3, base + 2);
-      }
-    }
-
-    const sRoadGeo = new THREE.BufferGeometry();
-    sRoadGeo.setAttribute('position', new THREE.Float32BufferAttribute(sVertices, 3));
-    sRoadGeo.setAttribute('uv', new THREE.Float32BufferAttribute(sUvs, 2));
-    sRoadGeo.setIndex(sIndices);
-    sRoadGeo.computeVertexNormals();
-    const sMesh = new THREE.Mesh(sRoadGeo, pathMat);
-    sMesh.receiveShadow = true;
-    sMesh.renderOrder = 2;
-    this.areaGroup.add(sMesh);
-
-    // 3. Farmhouse Exterior (at gentle flat baseline)
+    // 3. Farmhouse Exterior (Walls & Roof)
     const houseGroup = new THREE.Group();
-
-    // Contact AO Shadow
-    const houseShadow = WorldEnvironmentBuilder.createContactShadowAO(4.5);
-    houseShadow.position.y = 0.02;
-    houseGroup.add(houseShadow);
 
     const houseBaseMat = WorldEnvironmentBuilder.createGradientMaterial({
       color: 0xffedd5,
       bottomColor: 0xd4a373,
       topColor: 0xfff7ed,
       minY: -1.75,
-      maxY: 1.75
+      maxY: 1.75,
+      side: THREE.FrontSide
     });
     const houseBase = new THREE.Mesh(
       new THREE.BoxGeometry(6, 3.5, 4.5),
@@ -730,7 +816,8 @@ export class World3dService {
       bottomColor: 0x7f1d1d,
       topColor: 0xf87171,
       minY: -1.25,
-      maxY: 1.25
+      maxY: 1.25,
+      side: THREE.FrontSide
     });
     const roof = new THREE.Mesh(
       new THREE.ConeGeometry(5.2, 2.5, 4),
@@ -739,48 +826,6 @@ export class World3dService {
     roof.rotation.y = Math.PI / 4;
     roof.position.set(0, 4.4, 0);
     houseGroup.add(roof);
-
-    const doorMat = WorldEnvironmentBuilder.createGradientMaterial({
-      color: 0x78350f,
-      bottomColor: 0x451a03,
-      topColor: 0x92400e,
-      minY: -1.0,
-      maxY: 1.0
-    });
-    const door = new THREE.Mesh(
-      new THREE.BoxGeometry(1.2, 2.0, 0.1),
-      doorMat
-    );
-    door.position.set(0, 1.0, 2.3);
-    houseGroup.add(door);
-
-    const porchMat = WorldEnvironmentBuilder.createGradientMaterial({
-      color: 0xa16207,
-      bottomColor: 0x713f12,
-      topColor: 0xca8a04,
-      minY: -0.1,
-      maxY: 0.1
-    });
-    const porch = new THREE.Mesh(
-      new THREE.BoxGeometry(2.4, 0.2, 1.5),
-      porchMat
-    );
-    porch.position.set(0, 0.1, 2.9);
-    houseGroup.add(porch);
-
-    const chimneyMat = WorldEnvironmentBuilder.createGradientMaterial({
-      color: 0x9ca3af,
-      bottomColor: 0x475569,
-      topColor: 0xcfd8dc,
-      minY: -1.0,
-      maxY: 1.0
-    });
-    const chimney = new THREE.Mesh(
-      new THREE.BoxGeometry(0.8, 2.0, 0.8),
-      chimneyMat
-    );
-    chimney.position.set(2, 4.2, -1);
-    houseGroup.add(chimney);
 
     this.enableShadows(houseGroup);
 
@@ -815,7 +860,6 @@ export class World3dService {
         targetArea: 'town'
       }
     });
-    this.createExitSign(new THREE.Vector3(29.0, townExitY, -1.8), 'Town');
 
     // 5. North Exit to Whispering Mother Tree (Climbing Hill Road at z = -31.0)
     const treeExitY = this.getFarmHeight(0, -31.0);
@@ -830,7 +874,6 @@ export class World3dService {
         targetArea: 'goddess_tree'
       }
     });
-    this.createExitSign(new THREE.Vector3(-2.2, treeExitY, -29.0), 'Mother Tree');
 
     // 6. Farm Soil Field (Level & flat at y = 0)
     this.buildSoilGrid(new THREE.Vector3(3.5, 0, 4.0));
@@ -838,26 +881,13 @@ export class World3dService {
     // 7. Expanded Rolling Pasture & Barn on the West (Pasture knoll at x = -18.0)
     this.buildPastureAndAnimals(new THREE.Vector3(-18.0, 0, 2.0));
 
-    // 8. Shipping Bin (placed near farmhouse and crop field)
-    this.buildShippingBin(new THREE.Vector3(2.5, 0, 0.8));
-
-    // 9. Water Well (placed conveniently by the path)
-    this.buildWaterWell(new THREE.Vector3(-3.2, 0, 0.8));
-
-    // 10. Windmill atop the Scenic North-East Hill (Elevated Hill Terrace)
+    // 8. Windmill atop the Scenic North-East Hill (Elevated Hill Terrace)
     this.buildWindmill(new THREE.Vector3(22.0, 0, -16.0));
 
-    // 11. South Lookout Bluff Bench (Bangku Panorama Selatan Menghadap Laut)
-    this.createLookoutBench(new THREE.Vector3(20.0, this.getFarmHeight(20.0, 22.0), 22.0));
+    // 9. Merged Static Environmental Props (Benches, Signs, Shipping Bin, Water Well, Streetlamps, Fence, Shadows)
+    this.buildFarmsteadMergedStaticProps();
 
-    // 12. Crossroads Signpost
-    this.createCrossroadsSign(new THREE.Vector3(2.0, this.getFarmHeight(2.0, 1.2), 1.2));
-
-    // 13. Rustic Hay Bales in Pasture
-    this.createHayBale(new THREE.Vector3(-14.0, this.getFarmHeight(-14.0, -2.5), -2.5));
-    this.createHayBale(new THREE.Vector3(-12.5, this.getFarmHeight(-12.5, -3.2), -3.2));
-
-    // 14. Wildflower Clusters on Rolling Slopes (InstancedMesh Batch)
+    // 14. Wildflower Clusters on Rolling Slopes
     const flowerSpots = [
       { x: 12.0, z: -4.0, col: 0xfacc15 },
       { x: 15.0, z: -7.0, col: 0xf43f5e },
@@ -871,13 +901,10 @@ export class World3dService {
       { x: -8.0, z: -12.0, col: 0xfacc15 },
       { x: -15.0, z: -18.0, col: 0xec4899 },
       { x: 4.0, z: -18.0, col: 0xfde047 },
-      { x: -4.0, z: -25.0, col: 0x818cf8 }
+      { x: -4.0, z: -25.0, col: 0x818cf8 },
+      { x: 22.0, z: -12.0, col: 0xfbbf24 },
+      { x: -18.0, z: 22.0, col: 0xf472b6 }
     ];
-    const instancedFlowers = WorldEnvironmentBuilder.buildInstancedWildflowers(
-      flowerSpots,
-      (x, z) => this.getFarmHeight(x, z)
-    );
-    this.areaGroup.add(instancedFlowers);
 
     // 15. Scenic Trees Across the Expanded Farmstead & Rolling Bluffs (InstancedMesh Batch)
     const treePositions = [
@@ -921,9 +948,6 @@ export class World3dService {
       (x, z) => this.getFarmHeight(x, z)
     );
     this.areaGroup.add(instancedPines);
-    this.createStreetlamp(new THREE.Vector3(-2.0, this.getFarmHeight(-2.0, -10.0), -10.0));
-    this.createStreetlamp(new THREE.Vector3(2.0, this.getFarmHeight(2.0, -20.0), -20.0));
-    this.createStreetlamp(new THREE.Vector3(-2.0, this.getFarmHeight(-2.0, -28.0), -28.0));
 
     // 17. Expanded Perimeter Boundary Fences (InstancedMesh Batch)
     const instancedFences = WorldEnvironmentBuilder.buildInstancedFences(
@@ -935,7 +959,9 @@ export class World3dService {
     );
     this.areaGroup.add(instancedFences);
 
-    // 18. Random 3D Stylized Grass Tufts across Farmstead Meadow (InstancedMesh Batch)
+    // 18. Spatial Chunking & Frustum Culling Vegetation (24x24 Meter Grid - 9 Chunks)
+    // Partitions grass tufts and wildflowers into 24x24m spatial chunks.
+    // Off-screen chunks are culled from rendering, keeping FPS high and mobile thermals cool.
     const grassSeeds = [
       { x: -5, z: 8 }, { x: -8, z: 14 }, { x: -12, z: 6 }, { x: -16, z: 18 },
       { x: -22, z: 10 }, { x: -20, z: -8 }, { x: -15, z: -12 }, { x: -7, z: -18 },
@@ -947,27 +973,51 @@ export class World3dService {
       { x: 8, z: -6 }, { x: -3, z: 6 }, { x: -7, z: 2 }, { x: 11, z: 8 },
       { x: 18, z: 15 }, { x: -18, z: 12 }, { x: -14, z: -6 }, { x: 2, z: 16 },
       { x: 21, z: 25 }, { x: -6, z: 15 }, { x: -26, z: 18 }, { x: 15, z: 22 },
-      { x: -17, z: 26 }, { x: 7, z: 10 }, { x: 25, z: 2 }, { x: 23, z: -22 }
+      { x: -17, z: 26 }, { x: 7, z: 10 }, { x: 25, z: 2 }, { x: 23, z: -22 },
+      { x: -28, z: 10 }, { x: -24, z: -12 }, { x: 28, z: 10 }, { x: 12, z: -22 },
+      { x: 0, z: 22 }, { x: -14, z: 20 }, { x: 20, z: -2 }, { x: -2, z: -14 }
     ];
-    const instancedGrass = WorldEnvironmentBuilder.buildInstancedGrassTufts(
+
+    const microGrassSeeds = [
+      { x: -5, z: -8 }, { x: -8, z: -5 }, { x: 5, z: -8 }, { x: 8, z: -10 },
+      { x: 14, z: -12 }, { x: 18, z: -8 }, { x: 10, z: -2 }, { x: 12, z: 4 },
+      { x: 16, z: 8 }, { x: 20, z: 12 }, { x: 12, z: 14 }, { x: 6, z: 16 },
+      { x: -2, z: 14 }, { x: -8, z: 18 }, { x: -14, z: 15 }, { x: -20, z: 12 },
+      { x: -12, z: 6 }, { x: -7, z: 8 }, { x: -2, z: 8 }, { x: 1, z: 18 },
+      { x: 7, z: 20 }, { x: 15, z: 18 }, { x: 22, z: 20 }, { x: -16, z: -8 },
+      { x: -22, z: -6 }, { x: -10, z: -16 }, { x: -4, z: -18 }, { x: 6, z: -18 },
+      { x: 12, z: -18 }, { x: 20, z: -18 }, { x: -24, z: 2 }, { x: 24, z: -14 },
+      { x: 18, z: 24 }, { x: -18, z: -22 }, { x: 4, z: 24 }, { x: -22, z: 22 }
+    ];
+
+    const chunkedVeg = WorldEnvironmentBuilder.buildChunkedVegetation(
       grassSeeds,
-      (x, z) => this.getFarmHeight(x, z)
+      microGrassSeeds,
+      flowerSpots,
+      (x: number, z: number) => this.getFarmHeight(x, z),
+      24
     );
-    this.areaGroup.add(instancedGrass);
+    this.vegetationChunks = chunkedVeg.chunks;
+    this.gameState.totalChunks.set(chunkedVeg.chunks.length);
+    this.areaGroup.add(chunkedVeg.parentGroup);
 
     // 19. Random 3D Stylized Fluffy Bushes across Rolling Hills (InstancedMesh Batch)
     const bushSeeds = [
       { x: -9, z: -14, b: true }, { x: -14, z: -20, b: false }, { x: -6, z: -24, b: true },
-      { x: 5, z: -20, b: false }, { x: 12, z: -23, b: true }, { x: 18, z: -22, b: false },
+      { x: 5, z: -20, b: false }, { x: 12, z: -23, b: true },
       { x: 26, z: -14, b: true }, { x: 28, z: -5, b: false }, { x: 24, z: 5, b: true },
       { x: 28, z: 12, b: false }, { x: 24, z: 20, b: true }, { x: 17, z: 25, b: false },
       { x: 11, z: 23, b: true }, { x: 2, z: 25, b: false }, { x: -7, z: 24, b: true },
       { x: -15, z: 22, b: false }, { x: -23, z: 18, b: true }, { x: -27, z: 8, b: false },
       { x: -26, z: -6, b: true }, { x: -22, z: -14, b: false }, { x: -17, z: -4, b: true },
-      { x: -11, z: 10, b: false }, { x: 14, z: -4, b: true }, { x: 20, z: -12, b: false },
-      { x: 9, z: 15, b: true }, { x: -4, z: 12, b: false }, { x: 19, z: 11, b: true },
+      { x: -11, z: 10, b: false }, { x: 9, z: 15, b: true }, { x: -4, z: 12, b: false }, { x: 19, z: 11, b: true },
       { x: -19, z: 5, b: false }
-    ];
+    ].filter(s => {
+      // Clear props from both East Road bridge (21,0) and North Hill bridge (19.5, -12.5)
+      const d1 = Math.hypot(s.x - 21.0, s.z - 0.0);
+      const d2 = Math.hypot(s.x - 19.5, s.z - (-12.5));
+      return d1 >= 3.6 && d2 >= 3.2;
+    });
     const instancedBushes = WorldEnvironmentBuilder.buildInstancedBushes(
       bushSeeds,
       (x, z) => this.getFarmHeight(x, z)
@@ -980,73 +1030,635 @@ export class World3dService {
       { x: 25, z: -16 }, { x: 27, z: -10 }, { x: 25, z: 10 }, { x: 27, z: 22 },
       { x: 19, z: 26 }, { x: 12, z: 25 }, { x: -9, z: 26 }, { x: -19, z: 25 },
       { x: -27, z: 12 }, { x: -28, z: -10 }, { x: -24, z: -22 }, { x: -14, z: 8 },
-      { x: 16, z: -9 }, { x: 22, z: -6 }, { x: 11, z: 17 }, { x: -16, z: -10 },
+      { x: 11, z: 17 }, { x: -16, z: -10 },
       // North Mountain Slope & Ridge Cliff Rocks
       { x: -18, z: -28 }, { x: -8, z: -30 }, { x: 0, z: -32 }, { x: 8, z: -30 }, { x: 18, z: -28 },
       // South Boundary Cliff Wall Boulders
       { x: -28, z: 32 }, { x: -20, z: 33 }, { x: -10, z: 32 }, { x: 0, z: 33 }, { x: 10, z: 32 }, { x: 20, z: 33 }, { x: 28, z: 32 },
       // Windmill Hill & South Bluff Slope Edge Transition Boulders
-      { x: 18, z: -12 }, { x: 24, z: -18 }, { x: 21, z: -22 }, { x: 16, z: -20 },
+      { x: 24, z: -18 }, { x: 21, z: -22 }, { x: 16, z: -20 },
       { x: 18, z: 18 }, { x: 22, z: 24 }, { x: 14, z: 22 }
-    ];
+    ].filter(s => {
+      // Clear props from both East Road bridge (21,0) and North Hill bridge (19.5, -12.5)
+      const d1 = Math.hypot(s.x - 21.0, s.z - 0.0);
+      const d2 = Math.hypot(s.x - 19.5, s.z - (-12.5));
+      return d1 >= 3.6 && d2 >= 3.2;
+    });
     const instancedRocks = WorldEnvironmentBuilder.buildInstancedRocks(
       rockSeeds,
       (x, z) => this.getFarmHeight(x, z)
     );
     this.areaGroup.add(instancedRocks);
 
-    // 21. Ambient Occlusion (AO) Ground Contact Shadows for Structures
-    const shadowHouse = WorldEnvironmentBuilder.createContactShadowAO(4.6);
-    shadowHouse.position.set(0, this.getFarmHeight(0, -4.5) + 0.02, -4.5);
-    this.areaGroup.add(shadowHouse);
-
-    const shadowBarn = WorldEnvironmentBuilder.createContactShadowAO(5.2);
-    shadowBarn.position.set(-18.0, this.getFarmHeight(-18.0, 2.0) + 0.02, 2.0);
-    this.areaGroup.add(shadowBarn);
-
-    const shadowWindmill = WorldEnvironmentBuilder.createContactShadowAO(3.8);
-    shadowWindmill.position.set(22.0, this.getFarmHeight(22.0, -16.0) + 0.02, -16.0);
-    this.areaGroup.add(shadowWindmill);
-
-    const shadowWell = WorldEnvironmentBuilder.createContactShadowAO(1.6);
-    shadowWell.position.set(-3.2, this.getFarmHeight(-3.2, 0.8) + 0.02, 0.8);
-    this.areaGroup.add(shadowWell);
-
-    const shadowBin = WorldEnvironmentBuilder.createContactShadowAO(1.5);
-    shadowBin.position.set(2.5, this.getFarmHeight(2.5, 0.8) + 0.02, 0.8);
-    this.areaGroup.add(shadowBin);
-
-    // 22. Short 3D Micro Grass Tufts (InstancedMesh Batch)
-    const microGrassSeeds = [
-      { x: -5, z: -8 }, { x: -8, z: -5 }, { x: 5, z: -8 }, { x: 8, z: -10 },
-      { x: 14, z: -12 }, { x: 18, z: -8 }, { x: 10, z: -2 }, { x: 12, z: 4 },
-      { x: 16, z: 8 }, { x: 20, z: 12 }, { x: 12, z: 14 }, { x: 6, z: 16 },
-      { x: -2, z: 14 }, { x: -8, z: 18 }, { x: -14, z: 15 }, { x: -20, z: 12 },
-      { x: -12, z: 6 }, { x: -7, z: 8 }, { x: -2, z: 8 }, { x: 1, z: 18 },
-      { x: 7, z: 20 }, { x: 15, z: 18 }, { x: 22, z: 20 }, { x: -16, z: -8 },
-      { x: -22, z: -6 }, { x: -10, z: -16 }, { x: -4, z: -18 }, { x: 6, z: -18 },
-      { x: 12, z: -18 }, { x: 20, z: -18 }
-    ];
-    const instancedMicroGrass = WorldEnvironmentBuilder.buildInstancedMicroGrass(
-      microGrassSeeds,
-      (x, z) => this.getFarmHeight(x, z)
-    );
-    this.areaGroup.add(instancedMicroGrass);
-
-    // 23. Tiny Natural Ground Pebbles (InstancedMesh Batch)
+    // 21. Natural Pathway Edge Pebbles & Earth Crumbs (InstancedMesh Batch)
     const pebbleSeeds = [
       { x: -1, z: -2 }, { x: 1.5, z: -3 }, { x: -2.5, z: 2 }, { x: 2, z: 3.2 },
       { x: 4, z: 1.5 }, { x: 8, z: -1.5 }, { x: 11, z: -6 }, { x: 15, z: -11 },
       { x: 19, z: -14 }, { x: 10, z: 6 }, { x: 13, z: 11 }, { x: 17, z: 16 },
       { x: -6, z: 4 }, { x: -10, z: 2 }, { x: -15, z: 0 }, { x: -12, z: -4 },
       { x: -6, z: -10 }, { x: 3, z: -12 }, { x: 7, z: -15 }, { x: -1, z: 10 },
-      { x: 3, z: 13 }, { x: 8, z: 16 }
+      { x: 3, z: 13 }, { x: 8, z: 16 },
+      // Cobblestone Path Edge Pebbles
+      { x: 1.8, z: -4.5 }, { x: -1.8, z: -4.5 }, { x: 1.9, z: -12.5 }, { x: -1.9, z: -12.5 },
+      { x: 12.5, z: 1.8 }, { x: 12.5, z: -1.8 }, { x: 22.5, z: 1.8 }, { x: 22.5, z: -1.8 }
     ];
     const instancedPebbles = WorldEnvironmentBuilder.buildInstancedPebbles(
       pebbleSeeds,
       (x, z) => this.getFarmHeight(x, z)
     );
     this.areaGroup.add(instancedPebbles);
+
+    // 22. Red Spotted Forest Mushrooms near Tree Bases & Mountain Boulders
+    const mushroomSpots = [
+      { x: -15.5, z: -13.2 }, { x: -14.2, z: -15.1 }, { x: 15.8, z: -14.2 },
+      { x: -11.8, z: 15.2 }, { x: 16.5, z: 4.2 }, { x: -9.2, z: -24.5 },
+      { x: 18.5, z: -21.2 }, { x: -17.5, z: -9.5 }
+    ];
+    mushroomSpots.forEach(m => {
+      const my = this.getFarmHeight(m.x, m.z);
+      const shroom = WorldEnvironmentBuilder.createMushroom(new THREE.Vector3(m.x, my, m.z), 1.0);
+      this.enableShadows(shroom);
+      this.areaGroup.add(shroom);
+    });
+
+    // 23. Fallen Twigs & Logs for Natural Forest Floor
+    const twigSpots = [
+      { x: -12.5, z: -11.0 }, { x: 11.2, z: -9.5 }, { x: -14.5, z: 8.5 },
+      { x: 14.2, z: 12.5 }, { x: -7.5, z: -16.5 }, { x: 19.5, z: -10.2 }
+    ];
+    twigSpots.forEach(t => {
+      const ty = this.getFarmHeight(t.x, t.z);
+      const twig = WorldEnvironmentBuilder.createFallenTwig(new THREE.Vector3(t.x, ty, t.z), 1.0);
+      this.enableShadows(twig);
+      this.areaGroup.add(twig);
+    });
+
+    // 24. Natural Meandering River, Waterfall, Arch Bridge & Fishing Spot
+    this.buildMeanderingRiver();
+  }
+
+  /**
+   * 24. Natural Meandering Whispering Stream River
+   * Flowing in a continuous S-curve from North Mountain Cavern (z = -36.0) down to South Ocean (z = +36.0)
+   * Dynamically conforms to hill slope terrain elevation so water never clips or floats!
+   */
+  private buildMeanderingRiver(): void {
+    // 1. Natural Water Surface Mesh (Conforming Width ~3.2m)
+    const riverGeo = new THREE.PlaneGeometry(3.6, 72.0, 16, 96);
+    riverGeo.rotateX(-Math.PI / 2);
+
+    const pos = riverGeo.attributes['position'];
+    const uvs = riverGeo.attributes['uv'];
+
+    for (let i = 0; i < pos.count; i++) {
+      const px = pos.getX(i); // Relatif terhadap center bidang (-1.8 s/d 1.8)
+      const pz = pos.getZ(i);
+
+      // S-curve river path formula
+      const rx = 21.0 + Math.sin(pz * 0.08) * 1.8;
+      const newX = rx + px; 
+
+      pos.setX(i, newX);
+
+      // Dynamically conform water Y height to sit 0.22m inside carved channel level
+      // Evaluated at river center rx to ensure water plane is 100% level horizontally
+      const riverCenterBaseY = this.getTerrainBaseHeight(rx, pz);
+      pos.setY(i, riverCenterBaseY - 0.22);
+
+      // Flow direction UVs (North z=-36 to South z=+36)
+      uvs.setY(i, (36.0 - pz) / 4.8);
+    }
+    riverGeo.computeVertexNormals();
+
+    const waterTexture = WorldTexturesGenerator.createWaterCanvasTexture();
+    const waterMat = new THREE.MeshStandardMaterial({
+      map: waterTexture,
+      color: 0x0284c7,
+      roughness: 0.10,
+      metalness: 0.10,
+      transparent: true,
+      opacity: 0.88,
+      side: THREE.FrontSide // FrontSide avoids backface black void clipping!
+    });
+
+    this.waterPlane = new THREE.Mesh(riverGeo, waterMat);
+    this.waterPlane.receiveShadow = true;
+    this.waterPlane.renderOrder = 2;
+    this.areaGroup.add(this.waterPlane);
+
+    // 2. Riverbank Boulders & Smooth River Rocks (Anchored on grassy banks, clear of bridge entrances)
+    const riverRockMat = WorldEnvironmentBuilder.createGradientMaterial({
+      color: 0x64748b,
+      bottomColor: 0x334155,
+      topColor: 0x94a3b8,
+      minY: 0,
+      maxY: 1.0
+    });
+    const rockZPoints = [-30, -22, -6, 6, 14, 22, 28]; // Excludes areas near bridges!
+    rockZPoints.forEach(pz => {
+      for (const sideSign of [-1, 1]) {
+        const rx = 21.0 + Math.sin(pz * 0.08) * 1.8;
+        const rockX = rx + sideSign * (2.2 + Math.random() * 0.5);
+        const rockY = this.getFarmHeight(rockX, pz);
+        const rockSize = 0.35 + Math.random() * 0.35;
+        const riverRock = new THREE.Mesh(new THREE.DodecahedronGeometry(rockSize), riverRockMat);
+        riverRock.position.set(rockX, rockY + rockSize * 0.35, pz);
+        riverRock.rotation.set(Math.random(), Math.random(), Math.random());
+        riverRock.castShadow = true;
+        this.areaGroup.add(riverRock);
+      }
+    });
+
+    // 2b. Floating Logs & Debris (As seen in user reference)
+    const logMat = WorldEnvironmentBuilder.createGradientMaterial({
+      color: 0x92400e,
+      bottomColor: 0x451a03,
+      topColor: 0xb45309,
+      minY: -0.15,
+      maxY: 0.15
+    });
+    const logPoints = [
+      { z: -28, xOff: 0.2, rot: 0.4, s: 1.2 },
+      { z: -20, xOff: -0.4, rot: -0.3, s: 1.5 },
+      { z: -5, xOff: 0.3, rot: 0.15, s: 1.8 },
+      { z: 12, xOff: -0.1, rot: 0.6, s: 1.3 },
+      { z: 26, xOff: 0.5, rot: -0.2, s: 2.0 }
+    ];
+    logPoints.forEach(lp => {
+      const rx = 21.0 + Math.sin(lp.z * 0.08) * 1.8 + lp.xOff;
+      const bankBaseY = this.getTerrainBaseHeight(rx, lp.z);
+      const ly = bankBaseY - 0.16;
+      const log = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, lp.s, 6), logMat);
+      log.rotation.z = Math.PI / 2;
+      log.rotation.y = lp.rot;
+      log.position.set(rx, ly, lp.z);
+      log.castShadow = true;
+      log.receiveShadow = true;
+      this.areaGroup.add(log);
+    });
+
+    // 2. North Mountain Cavern Waterfall Source (x = 21.0, z = -34.5)
+    // Mountain Rock Cavern Grotto
+    const rockMat = WorldEnvironmentBuilder.createGradientMaterial({
+      color: 0x64748b,
+      bottomColor: 0x334155,
+      topColor: 0x94a3b8,
+      minY: 0,
+      maxY: 3.5
+    });
+
+    for (const rx of [-1.8, 0, 1.8]) {
+      const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(1.6), rockMat);
+      const ry = this.getFarmHeight(21.0 + rx, -34.5);
+      rock.position.set(21.0 + rx, ry + 1.2, -34.8);
+      rock.castShadow = true;
+      this.areaGroup.add(rock);
+    }
+
+    // Waterfall Foam Cascade coming out from mountain rocks
+    const sourceY = this.getFarmHeight(21.0, -34.5);
+    const fallGeo = new THREE.PlaneGeometry(3.6, 3.8, 6, 8);
+    fallGeo.translate(0, 1.9, 0);
+    const fallMat = new THREE.MeshBasicMaterial({
+      color: 0xe0f2fe,
+      transparent: true,
+      opacity: 0.82,
+      side: THREE.DoubleSide
+    });
+    const waterfall = new THREE.Mesh(fallGeo, fallMat);
+    waterfall.position.set(21.0, sourceY - 0.2, -34.2);
+    waterfall.rotation.x = 0.25;
+    this.areaGroup.add(waterfall);
+
+    // Waterfall Spray Foam Base
+    const sprayGeo = new THREE.CircleGeometry(2.4, 12);
+    sprayGeo.rotateX(-Math.PI / 2);
+    const sprayMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.55
+    });
+    const spray = new THREE.Mesh(sprayGeo, sprayMat);
+    spray.position.set(21.0, sourceY - 0.15, -33.2);
+    this.areaGroup.add(spray);
+
+    // 2b. South Sea Cliff Waterfall (River drops off southern cliff into ocean)
+    const southRiverX = 21.0 + Math.sin(32.0 * 0.08) * 1.8;
+    const southY = this.getTerrainBaseHeight(southRiverX, 32.0);
+
+    const southFallGeo = new THREE.PlaneGeometry(3.8, 4.5, 6, 8);
+    southFallGeo.translate(0, -2.25, 0);
+    const southFall = new THREE.Mesh(southFallGeo, fallMat);
+    southFall.position.set(southRiverX, southY - 0.28, 32.0);
+    southFall.rotation.x = -0.2;
+    this.areaGroup.add(southFall);
+
+    const southSpray = new THREE.Mesh(sprayGeo, sprayMat);
+    southSpray.position.set(southRiverX, -1.8, 33.2);
+    this.areaGroup.add(southSpray);
+
+    // 3. Rustic Wooden Bridges Across River (Bridge 1: East Road x=21.0, z=0.0 | Bridge 2: High North Canyon x=19.5, z=-12.5)
+    const bridgeSpecs = [
+      { x: 21.0, z: 0.0, width: 6.2, length: 2.8, rotY: 0, isHighBridge: false },
+      { x: 19.5, z: -12.5, width: 8.6, length: 2.8, rotY: 0.0, isHighBridge: true }
+    ];
+
+    const woodMat = WorldEnvironmentBuilder.createGradientMaterial({
+      color: 0xca8a04, // Light Amber/Honey Wood (As seen in user reference)
+      bottomColor: 0x854d0e,
+      topColor: 0xeab308,
+      minY: 0,
+      maxY: 1.0
+    });
+
+    const railWoodMat = WorldEnvironmentBuilder.createGradientMaterial({
+      color: 0xca8a04,
+      bottomColor: 0x713f12,
+      topColor: 0xeab308,
+      minY: 0,
+      maxY: 1.2
+    });
+
+    bridgeSpecs.forEach(b => {
+      const bridgeGroup = new THREE.Group();
+      const bBaseY = b.isHighBridge
+        ? Math.max(this.getTerrainBaseHeight(15.2, -12.5), this.getTerrainBaseHeight(23.8, -12.5))
+        : this.getTerrainBaseHeight(b.x, b.z);
+
+      // 1. Contact Shadow Decal
+      const bridgeShadow = WorldEnvironmentBuilder.createContactShadowAO(b.width * 0.55);
+      bridgeShadow.position.set(0, 0.02, 0);
+      bridgeGroup.add(bridgeShadow);
+
+      // 2. Detailed Deck (Individual Vertical Planks)
+      const plankCount = 18;
+      const plankWidth = b.width / plankCount;
+      for (let i = 0; i < plankCount; i++) {
+        const px = -b.width * 0.5 + plankWidth * 0.5 + i * plankWidth;
+        const pGeo = new THREE.BoxGeometry(plankWidth - 0.04, 0.16, b.length);
+        const plank = new THREE.Mesh(pGeo, woodMat);
+        plank.position.set(px, 0.12, 0);
+        plank.castShadow = true;
+        plank.receiveShadow = true;
+        bridgeGroup.add(plank);
+      }
+
+      // Main structural beams underneath
+      const beamGeo = new THREE.BoxGeometry(b.width, 0.18, 0.2);
+      for (const sideZ of [-b.length * 0.4, b.length * 0.4]) {
+        const beam = new THREE.Mesh(beamGeo, railWoodMat);
+        beam.position.set(0, 0, sideZ);
+        bridgeGroup.add(beam);
+      }
+
+      // 3. Decorative Rails (Triple horizontal bars + posts with caps)
+      const railHeight = 0.95;
+      const halfLen = b.length * 0.5 - 0.05;
+      for (const sideZ of [-halfLen, halfLen]) {
+        // 3 Horizontal Rail Bars
+        for (const h of [0.4, 0.68, 0.95]) {
+          const railBar = new THREE.Mesh(new THREE.BoxGeometry(b.width, 0.06, 0.08), railWoodMat);
+          railBar.position.set(0, h, sideZ);
+          railBar.castShadow = true;
+          bridgeGroup.add(railBar);
+        }
+
+        // Vertical Posts with small caps
+        const postOffsets = [-b.width * 0.45, -b.width * 0.25, 0, b.width * 0.25, b.width * 0.45];
+        postOffsets.forEach(lx => {
+          const post = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, railHeight, 6), railWoodMat);
+          post.position.set(lx, railHeight * 0.5, sideZ);
+          post.castShadow = true;
+          bridgeGroup.add(post);
+
+          const cap = new THREE.Mesh(new THREE.DodecahedronGeometry(0.09), railWoodMat);
+          cap.position.set(lx, railHeight + 0.05, sideZ);
+          bridgeGroup.add(cap);
+        });
+      }
+
+      // 4. Sturdy Bank Foundation Support Pillars (Embedded into riverbanks or canyon floor)
+      const pillarHeight = b.isHighBridge ? 3.8 : 0.95;
+      const pillarPosY = b.isHighBridge ? -1.9 : -0.35;
+      for (const pillarX of [-b.width * 0.42, -b.width * 0.15, b.width * 0.15, b.width * 0.42]) {
+        for (const pillarZ of [-halfLen, halfLen]) {
+          const pillar = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.18, pillarHeight, 8), railWoodMat);
+          pillar.position.set(pillarX, pillarPosY, pillarZ);
+          pillar.castShadow = true;
+          pillar.receiveShadow = true;
+          bridgeGroup.add(pillar);
+        }
+      }
+
+      // Position group exactly at intersection
+      bridgeGroup.position.set(b.x, bBaseY, b.z);
+      if (b.rotY) bridgeGroup.rotation.y = b.rotY;
+
+      bridgeGroup.renderOrder = 4; // Ensure drawn over water
+      this.areaGroup.add(bridgeGroup);
+    });
+
+    // 4. Water Lily Pads on River
+    const lilyGeo = new THREE.CircleGeometry(0.45, 8);
+    lilyGeo.rotateX(-Math.PI / 2);
+    const lilyMat = new THREE.MeshLambertMaterial({ color: 0x15803d });
+    const lilySpots = [
+      { x: 19.5, z: -10.0 }, { x: 16.8, z: -5.0 }, { x: 22.2, z: 8.0 }, { x: 23.5, z: 18.0 }
+    ];
+    lilySpots.forEach(lp => {
+      const ly = this.getFarmHeight(lp.x, lp.z);
+      const pad = new THREE.Mesh(lilyGeo, lilyMat);
+      pad.position.set(lp.x, ly - 0.16, lp.z);
+      this.areaGroup.add(pad);
+    });
+
+    // 5. Fishing Spot Marker & Ripples near Bridge
+    const fishSpotPos = new THREE.Vector3(21.0, 0.0, 3.8);
+    const fishY = this.getFarmHeight(fishSpotPos.x, fishSpotPos.z);
+    fishSpotPos.y = fishY;
+
+    this.interactiveMarkers.push({
+      pos: fishSpotPos,
+      radius: 2.2,
+      context: {
+        type: 'fish',
+        label: 'MEMANCING / FISHING',
+        subLabel: 'Sungai Whispering Stream',
+        icon: 'phishing'
+      }
+    });
+
+    const ringGeo = new THREE.RingGeometry(0.6, 0.8, 16);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+    const fishRing = new THREE.Mesh(ringGeo, ringMat);
+    fishRing.position.set(21.0, fishY - 0.16, 3.8);
+    this.areaGroup.add(fishRing);
+  }
+
+  /**
+   * Merged Static Environmental Props Builder
+   * Merges all static wooden props, stone/metal props, and contact AO shadow planes
+   * into 3 single high-performance draw calls for the entire Farmstead area.
+   */
+  private buildFarmsteadMergedStaticProps(): void {
+    const woodGeos: THREE.BufferGeometry[] = [];
+    const stoneGeos: THREE.BufferGeometry[] = [];
+    const shadowGeos: THREE.BufferGeometry[] = [];
+
+    const m4 = new THREE.Matrix4();
+    const tempMat = new THREE.Matrix4();
+
+    const addShadow = (x: number, z: number, size: number, scaleX = 1, scaleZ = 1) => {
+      const y = this.getFarmHeight(x, z) + 0.02;
+      const g = new THREE.PlaneGeometry(size * scaleX, size * scaleZ);
+      g.rotateX(-Math.PI / 2);
+      g.translate(x, y, z);
+      shadowGeos.push(g);
+    };
+
+    // 1. South Lookout Bluff Bench (x = 20, z = 22)
+    const bx = 20.0;
+    const bz = 22.0;
+    const by = this.getFarmHeight(bx, bz);
+    addShadow(bx, bz, 1.8, 1.4, 0.7);
+
+    m4.makeTranslation(bx, by, bz);
+    m4.multiply(tempMat.makeRotationY(-Math.PI / 4));
+
+    const bSeat = new THREE.BoxGeometry(1.8, 0.12, 0.6);
+    bSeat.applyMatrix4(new THREE.Matrix4().makeTranslation(0, 0.45, 0));
+    bSeat.applyMatrix4(m4);
+    woodGeos.push(bSeat);
+
+    const bBack = new THREE.BoxGeometry(1.8, 0.5, 0.1);
+    bBack.applyMatrix4(new THREE.Matrix4().makeTranslation(0, 0.75, -0.25));
+    bBack.applyMatrix4(m4);
+    woodGeos.push(bBack);
+
+    for (const lx of [-0.75, 0.75]) {
+      const leg = new THREE.BoxGeometry(0.1, 0.6, 0.5);
+      leg.applyMatrix4(new THREE.Matrix4().makeTranslation(lx, 0.15, 0));
+      leg.applyMatrix4(m4);
+      woodGeos.push(leg);
+    }
+
+    // 2. Crossroads Signpost (x = 2, z = 1.2)
+    const sx = 2.0;
+    const sz = 1.2;
+    const sy = this.getFarmHeight(sx, sz);
+    addShadow(sx, sz, 1.0);
+
+    const signPost = new THREE.CylinderGeometry(0.09, 0.09, 2.4, 6);
+    signPost.translate(sx, sy + 0.9, sz);
+    woodGeos.push(signPost);
+
+    const boardN = new THREE.BoxGeometry(0.9, 0.25, 0.08);
+    boardN.rotateY(Math.PI / 2);
+    boardN.translate(sx, sy + 1.6, sz + 0.35);
+    woodGeos.push(boardN);
+
+    const boardE = new THREE.BoxGeometry(0.9, 0.25, 0.08);
+    boardE.translate(sx + 0.35, sy + 1.3, sz);
+    woodGeos.push(boardE);
+
+    // 3. Exit Signs (Town & Mother Tree)
+    const exits = [
+      { x: 29.0, z: -1.8, name: 'Town' },
+      { x: -2.2, z: -29.0, name: 'Mother Tree' }
+    ];
+    for (const ex of exits) {
+      const ey = this.getFarmHeight(ex.x, ex.z);
+      addShadow(ex.x, ex.z, 0.8);
+
+      const p = new THREE.CylinderGeometry(0.08, 0.08, 1.8, 6);
+      p.translate(ex.x, ey + 0.6, ex.z);
+      woodGeos.push(p);
+
+      const b = new THREE.BoxGeometry(0.8, 0.45, 0.1);
+      b.translate(ex.x, ey + 1.2, ex.z);
+      woodGeos.push(b);
+    }
+
+    // 4. Hay Bales in Pasture
+    const bales = [
+      { x: -14.0, z: -2.5 },
+      { x: -12.5, z: -3.2 }
+    ];
+    for (const bale of bales) {
+      const hy = this.getFarmHeight(bale.x, bale.z);
+      addShadow(bale.x, bale.z, 1.4);
+
+      const bg = new THREE.CylinderGeometry(0.7, 0.7, 1.2, 8);
+      bg.rotateZ(Math.PI / 2);
+      bg.translate(bale.x, hy + 0.7, bale.z);
+      woodGeos.push(bg);
+    }
+
+    // 5. Wooden Pasture Fence Enclosure (x = -18, z = 2, w = 9, d = 8)
+    const pcx = -18.0;
+    const pcz = 2.0;
+    const pw = 9.0;
+    const pd = 8.0;
+    const halfW = pw / 2;
+    const halfD = pd / 2;
+
+    for (const fx of [pcx - halfW, pcx + halfW]) {
+      for (const fz of [pcz - halfD, pcz + halfD]) {
+        const fy = this.getFarmHeight(fx, fz);
+        const post = new THREE.CylinderGeometry(0.12, 0.12, 1.5, 6);
+        post.translate(fx, fy + 0.45, fz);
+        woodGeos.push(post);
+      }
+    }
+    const rails = [
+      { x: pcx, z: pcz - halfD, isZ: true },
+      { x: pcx - halfW, z: pcz, isZ: false },
+      { x: pcx + halfW, z: pcz, isZ: false }
+    ];
+    for (const r of rails) {
+      const ry = this.getFarmHeight(r.x, r.z);
+      const rail = new THREE.BoxGeometry(r.isZ ? pw : 0.12, 0.15, r.isZ ? 0.12 : pd);
+      rail.translate(r.x, ry + 0.45, r.z);
+      woodGeos.push(rail);
+    }
+
+    // 6. Shipping Bin (x = 2.5, z = 0.8)
+    const binX = 2.5;
+    const binZ = 0.8;
+    const binY = this.getFarmHeight(binX, binZ);
+    addShadow(binX, binZ, 2.2);
+
+    const binCrate = new THREE.BoxGeometry(1.6, 1.0, 1.2);
+    binCrate.translate(binX, binY + 0.5, binZ);
+    woodGeos.push(binCrate);
+
+    const binLid = new THREE.BoxGeometry(1.7, 0.15, 1.3);
+    binLid.translate(binX, binY + 1.05, binZ);
+    woodGeos.push(binLid);
+
+    this.interactiveMarkers.push({
+      pos: new THREE.Vector3(binX, binY, binZ),
+      radius: 1.8,
+      context: {
+        type: 'ship',
+        label: 'KOTAK PENJUALAN',
+        subLabel: 'Shipping Bin (Jual Hasil)',
+        icon: 'archive'
+      }
+    });
+
+    // 7. Water Well (x = -3.2, z = 0.8)
+    const wellX = -3.2;
+    const wellZ = 0.8;
+    const wellY = this.getFarmHeight(wellX, wellZ);
+    addShadow(wellX, wellZ, 2.8);
+
+    const wellBase = new THREE.CylinderGeometry(1.0, 1.1, 0.9, 8);
+    wellBase.translate(wellX, wellY + 0.45, wellZ);
+    stoneGeos.push(wellBase);
+
+    const wellRoof = new THREE.ConeGeometry(1.4, 0.9, 4);
+    wellRoof.rotateY(Math.PI / 4);
+    wellRoof.translate(wellX, wellY + 2.1, wellZ);
+    woodGeos.push(wellRoof);
+
+    for (const px of [-0.85, 0.85]) {
+      const wp = new THREE.CylinderGeometry(0.08, 0.08, 1.8, 4);
+      wp.translate(wellX + px, wellY + 0.9, wellZ);
+      woodGeos.push(wp);
+    }
+
+    this.interactiveMarkers.push({
+      pos: new THREE.Vector3(wellX, wellY, wellZ),
+      radius: 1.8,
+      context: {
+        type: 'refill',
+        label: 'SUMUR AIR / REFILL',
+        subLabel: 'Water Well',
+        icon: 'water_drop'
+      }
+    });
+
+    // 8. Farmhouse Porch, Door, Chimney
+    const houseY = this.getFarmHeight(0, -4.5);
+    addShadow(0, -4.5, 9.0);
+
+    const porch = new THREE.BoxGeometry(2.4, 0.2, 1.5);
+    porch.translate(0, houseY + 0.1, -4.5 + 2.9);
+    woodGeos.push(porch);
+
+    const door = new THREE.BoxGeometry(1.2, 2.0, 0.1);
+    door.translate(0, houseY + 1.0, -4.5 + 2.3);
+    woodGeos.push(door);
+
+    const chimney = new THREE.BoxGeometry(0.8, 2.0, 0.8);
+    chimney.translate(2.0, houseY + 4.2, -4.5 - 1.0);
+    stoneGeos.push(chimney);
+
+    // 9. Streetlamps along North Climbing Road
+    const lampPositions = [
+      { x: -2.0, z: -10.0 },
+      { x: 2.0, z: -20.0 },
+      { x: -2.0, z: -28.0 }
+    ];
+    for (const lp of lampPositions) {
+      const ly = this.getFarmHeight(lp.x, lp.z);
+      addShadow(lp.x, lp.z, 0.9);
+
+      const pole = new THREE.CylinderGeometry(0.08, 0.12, 3.2, 6);
+      pole.translate(lp.x, ly + 1.3, lp.z);
+      stoneGeos.push(pole);
+
+      const box = new THREE.DodecahedronGeometry(0.28);
+      box.translate(lp.x, ly + 2.9, lp.z);
+      stoneGeos.push(box);
+    }
+
+    // 10. Barn & Windmill AO Shadows
+    addShadow(-18.0, 2.0, 8.0);
+    addShadow(22.0, -16.0, 7.5);
+
+    // Create Merged Meshes
+    if (woodGeos.length > 0) {
+      const mergedWoodGeo = WorldEnvironmentBuilder.safeMergeGeometries(woodGeos, false);
+      const woodMat = new THREE.MeshLambertMaterial({
+        color: 0x92400e,
+        side: THREE.FrontSide
+      });
+      const woodMesh = new THREE.Mesh(mergedWoodGeo, woodMat);
+      woodMesh.castShadow = true;
+      woodMesh.receiveShadow = true;
+      woodMesh.renderOrder = 3;
+      this.areaGroup.add(woodMesh);
+    }
+
+    if (stoneGeos.length > 0) {
+      const mergedStoneGeo = WorldEnvironmentBuilder.safeMergeGeometries(stoneGeos, false);
+      const stoneMat = new THREE.MeshLambertMaterial({
+        color: 0x64748b,
+        side: THREE.FrontSide
+      });
+      const stoneMesh = new THREE.Mesh(mergedStoneGeo, stoneMat);
+      stoneMesh.castShadow = true;
+      stoneMesh.receiveShadow = true;
+      stoneMesh.renderOrder = 3;
+      this.areaGroup.add(stoneMesh);
+    }
+
+    if (shadowGeos.length > 0) {
+      const mergedShadowGeo = WorldEnvironmentBuilder.safeMergeGeometries(shadowGeos, false);
+      const shadowMat = new THREE.MeshBasicMaterial({
+        map: WorldEnvironmentBuilder.getShadowTexture(),
+        transparent: true,
+        opacity: 0.45,
+        depthWrite: false,
+        side: THREE.FrontSide
+      });
+      const shadowMesh = new THREE.Mesh(mergedShadowGeo, shadowMat);
+      shadowMesh.renderOrder = 1;
+      this.areaGroup.add(shadowMesh);
+    }
   }
 
   // AREA 2: FARMER'S COTTAGE INTERIOR
@@ -1525,9 +2137,14 @@ export class World3dService {
 
     const ground = new THREE.Mesh(
       groundGeo,
-      new THREE.MeshLambertMaterial({
-        map: this.grassTexture,
-        vertexColors: true
+      WorldEnvironmentBuilder.createOrganicTerrainMaterial({
+        grassTexture: this.grassTexture,
+        soilTexture: this.soilGroundTexture,
+        noiseTexture: this.noiseTexture,
+        tilingScale: 0.18,
+        grassBaseColor: 0x429e22,
+        grassWarmColor: 0x6ad42e,
+        grassCoolColor: 0x226e18
       })
     );
     ground.position.y = -1.5;
@@ -1690,52 +2307,24 @@ export class World3dService {
       this.farmingGridGroup.remove(this.farmingGridGroup.children[0]);
     }
 
-    // 1. COMBINED SINGLE LINESEGMENTS FOR ENTIRE HOE GRID OUTLINE (1 Draw Call)
-    const lineVerts: number[] = [];
-    const half = 1.36 * 0.5;
-    const yLine = 0.025;
-
-    plots.forEach(tile => {
-      const wx = origin.x + tile.x * 1.5;
-      const wz = origin.z + tile.z * 1.5;
-
-      // 4 segment perimeter box per cell
-      lineVerts.push(
-        wx - half, yLine, wz - half,  wx + half, yLine, wz - half,
-        wx + half, yLine, wz - half,  wx + half, yLine, wz + half,
-        wx + half, yLine, wz + half,  wx - half, yLine, wz + half,
-        wx - half, yLine, wz + half,  wx - half, yLine, wz - half
-      );
-    });
-
-    const gridLineGeo = new THREE.BufferGeometry();
-    gridLineGeo.setAttribute('position', new THREE.Float32BufferAttribute(lineVerts, 3));
-    const gridWireMat = new THREE.LineBasicMaterial({
-      color: 0xf59e0b, // warm golden-orange outline
-      transparent: true,
-      opacity: 0.35,
-      depthWrite: false
-    });
-    const gridLinesMesh = new THREE.LineSegments(gridLineGeo, gridWireMat);
-    gridLinesMesh.castShadow = false;
-    gridLinesMesh.receiveShadow = false;
-    this.farmingGridGroup.add(gridLinesMesh);
-
-    // 2. SINGLE INSTANCEDMESH FOR SUBTLE GRID FILL TINT (1 Draw Call)
+    // Single Instanced subtle farm plot indicator (soft warm tint, zero wireframe line clutter)
     const fillPlaneGeo = new THREE.PlaneGeometry(1.36, 1.36);
     fillPlaneGeo.rotateX(-Math.PI / 2);
     const fillMat = new THREE.MeshBasicMaterial({
-      color: 0xfbbf24,
+      color: 0xf59e0b,
       transparent: true,
-      opacity: 0.06,
-      depthWrite: false
+      opacity: 0.08,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1.0,
+      polygonOffsetUnits: -2.0
     });
     const gridFillInst = new THREE.InstancedMesh(fillPlaneGeo, fillMat, plots.length);
     gridFillInst.castShadow = false;
     gridFillInst.receiveShadow = false;
 
     plots.forEach((tile, i) => {
-      dummy.position.set(origin.x + tile.x * 1.5, 0.02, origin.z + tile.z * 1.5);
+      dummy.position.set(origin.x + tile.x * 1.5, 0.025, origin.z + tile.z * 1.5);
       dummy.scale.set(1, 1, 1);
       dummy.rotation.set(0, 0, 0);
       dummy.updateMatrix();
@@ -1863,7 +2452,7 @@ export class World3dService {
         const cropMesh = this.createCropModel(tile.crop.type, tile.crop.stage);
         cropMesh.position.set(origin.x + tile.x * 1.5, 0.08, origin.z + tile.z * 1.5);
         cropMesh.renderOrder = 3;
-        this.enableShadows(cropMesh, true, true);
+        this.enableShadows(cropMesh, false, true); // Crops receive shadow without extra shadow pass draw calls
         this.areaGroup.add(cropMesh);
         this.soilTileMeshes.set(`crop_${tile.x}_${tile.z}`, cropMesh);
       }
@@ -2495,15 +3084,15 @@ export class World3dService {
     });
   }
 
-  // PLAYER CHARACTER (Cute Harvest Moon Tree of Tranquility chibi farmer with Gradient Shading)
+  // PLAYER CHARACTER (Detailed Harvest Moon Tree of Tranquility Chibi Farmer - No Hat)
   private createPlayerMesh(): void {
     this.playerGroup = new THREE.Group();
 
-    // Body / Overalls with vertical denim gradient
+    // 1. Denim Overalls Body with vertical gradient
     const bodyGeo = new THREE.CylinderGeometry(0.28, 0.38, 0.85, 8);
     const bodyMat = WorldEnvironmentBuilder.createGradientMaterial({
       color: 0x1d4ed8,
-      bottomColor: 0x172554, // Deep indigo base
+      bottomColor: 0x172554, // Deep indigo denim base
       topColor: 0x3b82f6,    // Sky denim crest
       minY: -0.42,
       maxY: 0.42
@@ -2512,7 +3101,35 @@ export class World3dService {
     this.playerBody.position.y = 0.75;
     this.playerGroup.add(this.playerBody);
 
-    // Shirt collar / chest
+    // Overalls Shoulder Straps
+    const strapMat = new THREE.MeshLambertMaterial({ color: 0x1e40af });
+    const strapL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.42, 0.44), strapMat);
+    strapL.position.set(-0.16, 0.96, 0.02);
+    this.playerGroup.add(strapL);
+
+    const strapR = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.42, 0.44), strapMat);
+    strapR.position.set(0.16, 0.96, 0.02);
+    this.playerGroup.add(strapR);
+
+    // Overalls Brass Buttons
+    const buttonGeo = new THREE.CylinderGeometry(0.035, 0.035, 0.03, 6);
+    buttonGeo.rotateX(Math.PI / 2);
+    const buttonMat = new THREE.MeshLambertMaterial({ color: 0xf59e0b }); // Gold brass
+    const buttonL = new THREE.Mesh(buttonGeo, buttonMat);
+    buttonL.position.set(-0.16, 0.88, 0.23);
+    this.playerGroup.add(buttonL);
+
+    const buttonR = new THREE.Mesh(buttonGeo, buttonMat);
+    buttonR.position.set(0.16, 0.88, 0.23);
+    this.playerGroup.add(buttonR);
+
+    // Front Pouch Pocket
+    const pocketMat = new THREE.MeshLambertMaterial({ color: 0x1e3a8a });
+    const pocket = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.2, 0.04), pocketMat);
+    pocket.position.set(0, 0.72, 0.24);
+    this.playerGroup.add(pocket);
+
+    // 2. White/Cream Shirt Underneath
     const shirtMat = WorldEnvironmentBuilder.createGradientMaterial({
       color: 0xffedd5,
       bottomColor: 0xfed7aa,
@@ -2520,15 +3137,33 @@ export class World3dService {
       minY: -0.15,
       maxY: 0.15
     });
-    const shirt = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.3, 0.4), shirtMat);
-    shirt.position.set(0, 0.95, 0.05);
+    const shirt = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.28, 0.38), shirtMat);
+    shirt.position.set(0, 0.96, 0.02);
     this.playerGroup.add(shirt);
 
-    // Head with rosy cheeks gradient
-    const headGeo = new THREE.SphereGeometry(0.34, 10, 10);
+    // 3. Red Bandana / Scarf around Neck
+    const scarfMat = WorldEnvironmentBuilder.createGradientMaterial({
+      color: 0xd92626,
+      bottomColor: 0x991b1b,
+      topColor: 0xef4444,
+      minY: -0.06,
+      maxY: 0.06
+    });
+    const scarfRing = new THREE.Mesh(new THREE.TorusGeometry(0.22, 0.05, 6, 12), scarfMat);
+    scarfRing.rotation.x = Math.PI / 2;
+    scarfRing.position.set(0, 1.15, 0);
+    this.playerGroup.add(scarfRing);
+
+    const scarfKnot = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.16, 4), scarfMat);
+    scarfKnot.rotation.set(0.4, 0, -0.2);
+    scarfKnot.position.set(-0.08, 1.08, 0.22);
+    this.playerGroup.add(scarfKnot);
+
+    // 4. Head with Rosy Cheeks & Anime Face Details
+    const headGeo = new THREE.SphereGeometry(0.34, 12, 12);
     const headMat = WorldEnvironmentBuilder.createGradientMaterial({
-      color: 0xfecdd3,
-      bottomColor: 0xfba0ac,
+      color: 0xffe4e6,
+      bottomColor: 0xfecdd3,
       topColor: 0xfff1f2,
       minY: -0.34,
       maxY: 0.34
@@ -2537,7 +3172,44 @@ export class World3dService {
     head.position.y = 1.45;
     this.playerGroup.add(head);
 
-    // Stylized Anime Chibi Hair (Warm Amber-Chestnut Brown with Gradient)
+    // Anime Eyes (Deep navy with white shine highlights)
+    const eyeMat = new THREE.MeshBasicMaterial({ color: 0x1e293b });
+    const shineMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+    const eyeGeo = new THREE.CylinderGeometry(0.045, 0.045, 0.02, 8);
+    eyeGeo.rotateX(Math.PI / 2);
+
+    const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+    eyeL.position.set(-0.11, 1.46, 0.31);
+    this.playerGroup.add(eyeL);
+
+    const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
+    eyeR.position.set(0.11, 1.46, 0.31);
+    this.playerGroup.add(eyeR);
+
+    const shineGeo = new THREE.SphereGeometry(0.018, 6, 6);
+    const shineL = new THREE.Mesh(shineGeo, shineMat);
+    shineL.position.set(-0.095, 1.48, 0.33);
+    this.playerGroup.add(shineL);
+
+    const shineR = new THREE.Mesh(shineGeo, shineMat);
+    shineR.position.set(0.125, 1.48, 0.33);
+    this.playerGroup.add(shineR);
+
+    // Soft Rosy Cheeks
+    const cheekMat = new THREE.MeshBasicMaterial({ color: 0xf43f5e, transparent: true, opacity: 0.65 });
+    const cheekGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.02, 8);
+    cheekGeo.rotateX(Math.PI / 2);
+
+    const cheekL = new THREE.Mesh(cheekGeo, cheekMat);
+    cheekL.position.set(-0.18, 1.40, 0.28);
+    this.playerGroup.add(cheekL);
+
+    const cheekR = new THREE.Mesh(cheekGeo, cheekMat);
+    cheekR.position.set(0.18, 1.40, 0.28);
+    this.playerGroup.add(cheekR);
+
+    // 5. Stylized Anime Chibi Hair (Warm Amber-Chestnut Brown with Layered Locks - NO HAT)
     const hairGroup = new THREE.Group();
     const hairMat = WorldEnvironmentBuilder.createGradientMaterial({
       color: 0x92400e,
@@ -2547,40 +3219,49 @@ export class World3dService {
       maxY: 0.28
     });
 
-    // Main Hair Crown / Volume
+    // Hair Cap / Crown
     const hairCap = new THREE.Mesh(
-      new THREE.SphereGeometry(0.36, 8, 8),
+      new THREE.SphereGeometry(0.36, 10, 10),
       hairMat
     );
-    hairCap.position.set(0, 0.05, -0.04);
+    hairCap.position.set(0, 0.06, -0.02);
     hairGroup.add(hairCap);
 
-    // Front Bangs
-    const bang1 = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.26, 4), hairMat);
-    bang1.rotation.set(0.35, 0, 0.3);
-    bang1.position.set(-0.14, 0.07, 0.27);
+    // Front Bangs (Center & Sides)
+    const bang1 = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.28, 4), hairMat);
+    bang1.rotation.set(0.35, 0, 0.25);
+    bang1.position.set(-0.12, 0.08, 0.28);
     hairGroup.add(bang1);
 
-    const bang2 = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.28, 4), hairMat);
-    bang2.rotation.set(0.32, 0, -0.2);
-    bang2.position.set(0.08, 0.09, 0.28);
+    const bang2 = new THREE.Mesh(new THREE.ConeGeometry(0.13, 0.30, 4), hairMat);
+    bang2.rotation.set(0.32, 0, -0.18);
+    bang2.position.set(0.09, 0.10, 0.29);
     hairGroup.add(bang2);
 
-    // Side Tufts
-    const tuftL = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.22, 4), hairMat);
+    const bang3 = new THREE.Mesh(new THREE.ConeGeometry(0.10, 0.22, 4), hairMat);
+    bang3.rotation.set(0.30, 0, -0.4);
+    bang3.position.set(0.22, 0.06, 0.25);
+    hairGroup.add(bang3);
+
+    // Side Locks & Back Fluff
+    const tuftL = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.25, 4), hairMat);
     tuftL.rotation.set(0, 0, 0.45);
-    tuftL.position.set(-0.3, 0.02, 0.08);
+    tuftL.position.set(-0.31, 0.02, 0.06);
     hairGroup.add(tuftL);
 
-    const tuftR = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.22, 4), hairMat);
+    const tuftR = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.25, 4), hairMat);
     tuftR.rotation.set(0, 0, -0.45);
-    tuftR.position.set(0.3, 0.02, 0.08);
+    tuftR.position.set(0.31, 0.02, 0.06);
     hairGroup.add(tuftR);
+
+    const backFluff = new THREE.Mesh(new THREE.DodecahedronGeometry(0.22), hairMat);
+    backFluff.position.set(0, -0.08, -0.28);
+    hairGroup.add(backFluff);
 
     hairGroup.position.set(0, 1.48, 0);
     this.playerGroup.add(hairGroup);
 
-    // Backpack
+    // 6. Leather Backpack with Flap & Buckle
     const backpackMat = WorldEnvironmentBuilder.createGradientMaterial({
       color: 0x78350f,
       bottomColor: 0x451a03,
@@ -2589,13 +3270,21 @@ export class World3dService {
       maxY: 0.22
     });
     const backpack = new THREE.Mesh(
-      new THREE.BoxGeometry(0.42, 0.45, 0.25),
+      new THREE.BoxGeometry(0.42, 0.45, 0.24),
       backpackMat
     );
-    backpack.position.set(0, 0.82, -0.3);
+    backpack.position.set(0, 0.82, -0.28);
     this.playerGroup.add(backpack);
 
-    // Legs & Boots
+    const packFlap = new THREE.Mesh(new THREE.BoxGeometry(0.40, 0.16, 0.26), backpackMat);
+    packFlap.position.set(0, 0.98, -0.28);
+    this.playerGroup.add(packFlap);
+
+    const packBuckle = new THREE.Mesh(buttonGeo, buttonMat);
+    packBuckle.position.set(0, 0.80, -0.41);
+    this.playerGroup.add(packBuckle);
+
+    // 7. Legs & Boots
     const legGeo = new THREE.CylinderGeometry(0.1, 0.1, 0.45, 6);
     const legMat = WorldEnvironmentBuilder.createGradientMaterial({
       color: 0x1e3a8a,
@@ -2629,7 +3318,7 @@ export class World3dService {
     rightBoot.position.set(0, -0.16, 0.05);
     this.playerRightLeg.add(rightBoot);
 
-    // Arms
+    // 8. Arms & Sleeves
     const armGeo = new THREE.CylinderGeometry(0.08, 0.08, 0.45, 6);
     const armMat = WorldEnvironmentBuilder.createGradientMaterial({
       color: 0xef4444,
@@ -2693,125 +3382,162 @@ export class World3dService {
     const timeDec = hour + minute / 60; // e.g. 6.63 for 06:38 AM
     const isRain = this.gameState.weather() === 'Rainy';
 
-    let sunColor: THREE.Color;
-    let sunIntensity: number;
-    let sunPos: THREE.Vector3;
-    let ambColor: THREE.Color;
-    let ambIntensity: number;
-    let skyColor: THREE.Color;
-    let fogColor: THREE.Color;
+    let sunIntensity = 1.0;
+    let ambIntensity = 0.65;
     let fogDensity = 0.016;
 
     if (isRain) {
       // Overcast / Rainy Mood (Diffuse slate grey lighting & mist)
-      sunColor = new THREE.Color(0x94a3b8);
-      sunIntensity = 0.45;
-      sunPos = new THREE.Vector3(12, 16, 12);
-      ambColor = new THREE.Color(0x64748b);
-      ambIntensity = 0.55;
-      skyColor = new THREE.Color(0x64748b);
-      fogColor = new THREE.Color(0x64748b);
-      fogDensity = 0.025;
-    } else if (timeDec >= 5.0 && timeDec < 8.0) {
-      // 🌅 EARLY MORNING / DAWN (05:00 - 08:00 AM, including 06:26 AM / 6.43)
-      // Warm golden morning sun (0xfff0dd) with low eastern horizon angle
-      const t = (timeDec - 5.0) / 3.0; // 0 to 1
-      sunPos = new THREE.Vector3(
-        THREE.MathUtils.lerp(26, 16, t),
-        THREE.MathUtils.lerp(5.5, 16, t),
-        THREE.MathUtils.lerp(17, 13, t)
+      this._tempSunColor.setHex(0xb0c4de);
+      sunIntensity = 0.85;
+      this._tempSunPos.set(12, 16, 12);
+      this._tempAmbColor.setHex(0x94a3b8);
+      ambIntensity = 0.75;
+      this._tempSkyColor.setHex(0x64748b);
+      this._tempFogColor.setHex(0x94a3b8);
+      fogDensity = 0.015;
+    } else if (timeDec >= 5.0 && timeDec < 8.5) {
+      // 🌅 EARLY MORNING / DAWN (05:00 - 08:30 AM, e.g. 06:00 AM / 06:38 AM)
+      const t = (timeDec - 5.0) / 3.5; // 0 to 1
+      this._tempSunPos.set(
+        THREE.MathUtils.lerp(24, 16, t),
+        THREE.MathUtils.lerp(12.0, 22.0, t),
+        THREE.MathUtils.lerp(16, 14, t)
       );
-      // Warm golden morning sun (0xfff0dd) transitioning smoothly into bright midday
-      sunColor = new THREE.Color().lerpColors(new THREE.Color(0xfff0dd), new THREE.Color(0xfffdf5), t);
-      sunIntensity = THREE.MathUtils.lerp(1.16, 1.25, t);
-      // Ambient warm peach / amber morning glow
-      ambColor = new THREE.Color().lerpColors(new THREE.Color(0xfed7aa), new THREE.Color(0xfef3c7), t);
-      ambIntensity = THREE.MathUtils.lerp(0.66, 0.72, t);
-      // Sky & Fog: Soft morning sky pastel (0xdbebf5) blending horizon hills naturally
-      skyColor = new THREE.Color().lerpColors(new THREE.Color(0xdbebf5), new THREE.Color(0x93c5fd), t);
-      fogColor = new THREE.Color().lerpColors(new THREE.Color(0xdbebf5), new THREE.Color(0xbbe3f5), t);
-      fogDensity = THREE.MathUtils.lerp(0.016, 0.015, t);
-    } else if (timeDec >= 8.0 && timeDec < 16.0) {
-      // ☀️ DAYTIME / MIDDAY (08:00 AM - 04:00 PM) - Crisp bright daylight, brilliant sky
-      const t = (timeDec - 8.0) / 8.0;
-      sunPos = new THREE.Vector3(
+      this._colA.setHex(0xfffaed);
+      this._colB.setHex(0xffffff);
+      this._tempSunColor.lerpColors(this._colA, this._colB, t);
+      sunIntensity = THREE.MathUtils.lerp(1.35, 1.55, t);
+
+      this._colA.setHex(0xfff1db);
+      this._colB.setHex(0xfffbeb);
+      this._tempAmbColor.lerpColors(this._colA, this._colB, t);
+      ambIntensity = THREE.MathUtils.lerp(0.82, 0.92, t);
+
+      this._colA.setHex(0xbae6fd);
+      this._colB.setHex(0x7dd3fc);
+      this._tempSkyColor.lerpColors(this._colA, this._colB, t);
+
+      this._colA.setHex(0xe0f2fe);
+      this._colB.setHex(0xbae6fd);
+      this._tempFogColor.lerpColors(this._colA, this._colB, t);
+      fogDensity = THREE.MathUtils.lerp(0.009, 0.007, t);
+    } else if (timeDec >= 8.5 && timeDec < 16.5) {
+      // ☀️ DAYTIME / MIDDAY (08:30 AM - 04:30 PM) - Crisp bright daylight, brilliant blue sky
+      const t = (timeDec - 8.5) / 8.0;
+      this._tempSunPos.set(
         THREE.MathUtils.lerp(16, -12, t),
-        THREE.MathUtils.lerp(22, 27, Math.sin(t * Math.PI)),
+        THREE.MathUtils.lerp(24, 28, Math.sin(t * Math.PI)),
         THREE.MathUtils.lerp(14, 12, t)
       );
-      sunColor = new THREE.Color(0xfffdf5);
-      sunIntensity = 1.25;
-      ambColor = new THREE.Color(0xfffbeb);
-      ambIntensity = 0.74;
-      skyColor = new THREE.Color(0x93c5fd);
-      fogColor = new THREE.Color(0xbbe3f5);
-      fogDensity = 0.015;
-    } else if (timeDec >= 16.0 && timeDec < 18.5) {
-      // 🌇 GOLDEN HOUR / LATE AFTERNOON (04:00 PM - 06:30 PM) - Warm Amber Glow, lengthening west shadows
-      const t = (timeDec - 16.0) / 2.5;
-      sunPos = new THREE.Vector3(
+      this._tempSunColor.setHex(0xffffff);
+      sunIntensity = 1.6;
+      this._tempAmbColor.setHex(0xfffdf5);
+      ambIntensity = 0.95;
+      this._tempSkyColor.setHex(0x38bdf8);
+      this._tempFogColor.setHex(0xbae6fd);
+      fogDensity = 0.006;
+    } else if (timeDec >= 16.5 && timeDec < 18.5) {
+      // 🌇 GOLDEN HOUR / LATE AFTERNOON (04:30 PM - 06:30 PM)
+      const t = (timeDec - 16.5) / 2.0;
+      this._tempSunPos.set(
         THREE.MathUtils.lerp(-12, -26, t),
-        THREE.MathUtils.lerp(20, 6.0, t),
+        THREE.MathUtils.lerp(22, 10.0, t),
         THREE.MathUtils.lerp(12, 16, t)
       );
-      sunColor = new THREE.Color().lerpColors(new THREE.Color(0xfbbf24), new THREE.Color(0xf97316), t);
-      sunIntensity = THREE.MathUtils.lerp(1.2, 1.0, t);
-      ambColor = new THREE.Color().lerpColors(new THREE.Color(0xfed7aa), new THREE.Color(0xfbcfe8), t);
-      ambIntensity = THREE.MathUtils.lerp(0.7, 0.58, t);
-      skyColor = new THREE.Color().lerpColors(new THREE.Color(0xfcd34d), new THREE.Color(0xfb923c), t);
-      fogColor = new THREE.Color().lerpColors(new THREE.Color(0xfed7aa), new THREE.Color(0xf97316), t);
-      fogDensity = THREE.MathUtils.lerp(0.015, 0.021, t);
+      this._colA.setHex(0xfef08a);
+      this._colB.setHex(0xfb923c);
+      this._tempSunColor.lerpColors(this._colA, this._colB, t);
+      sunIntensity = THREE.MathUtils.lerp(1.5, 1.25, t);
+
+      this._colA.setHex(0xfef3c7);
+      this._colB.setHex(0xfed7aa);
+      this._tempAmbColor.lerpColors(this._colA, this._colB, t);
+      ambIntensity = THREE.MathUtils.lerp(0.9, 0.78, t);
+
+      this._colA.setHex(0x38bdf8);
+      this._colB.setHex(0xfb923c);
+      this._tempSkyColor.lerpColors(this._colA, this._colB, t);
+
+      this._colA.setHex(0xbae6fd);
+      this._colB.setHex(0xfbcfe8);
+      this._tempFogColor.lerpColors(this._colA, this._colB, t);
+      fogDensity = THREE.MathUtils.lerp(0.007, 0.012, t);
     } else if (timeDec >= 18.5 && timeDec < 20.0) {
-      // 🌆 DUSK / TWILIGHT (06:30 PM - 08:00 PM) - Crimson / purple twilight
+      // 🌆 DUSK / TWILIGHT (06:30 PM - 08:00 PM)
       const t = (timeDec - 18.5) / 1.5;
-      sunPos = new THREE.Vector3(-28, THREE.MathUtils.lerp(5.0, 1.0, t), 16);
-      sunColor = new THREE.Color().lerpColors(new THREE.Color(0xea580c), new THREE.Color(0x7c3aed), t);
-      sunIntensity = THREE.MathUtils.lerp(0.85, 0.35, t);
-      ambColor = new THREE.Color().lerpColors(new THREE.Color(0xc084fc), new THREE.Color(0x312e81), t);
-      ambIntensity = THREE.MathUtils.lerp(0.55, 0.4, t);
-      skyColor = new THREE.Color().lerpColors(new THREE.Color(0xf97316), new THREE.Color(0x1e1b4b), t);
-      fogColor = new THREE.Color().lerpColors(new THREE.Color(0xc084fc), new THREE.Color(0x1e1b4b), t);
-      fogDensity = 0.022;
+      this._tempSunPos.set(-28, THREE.MathUtils.lerp(10.0, 3.0, t), 16);
+      this._colA.setHex(0xf97316);
+      this._colB.setHex(0xa855f7);
+      this._tempSunColor.lerpColors(this._colA, this._colB, t);
+      sunIntensity = THREE.MathUtils.lerp(1.1, 0.55, t);
+
+      this._colA.setHex(0xfed7aa);
+      this._colB.setHex(0x6366f1);
+      this._tempAmbColor.lerpColors(this._colA, this._colB, t);
+      ambIntensity = THREE.MathUtils.lerp(0.75, 0.52, t);
+
+      this._colA.setHex(0xf97316);
+      this._colB.setHex(0x1e1b4b);
+      this._tempSkyColor.lerpColors(this._colA, this._colB, t);
+
+      this._colA.setHex(0xfbcfe8);
+      this._colB.setHex(0x312e81);
+      this._tempFogColor.lerpColors(this._colA, this._colB, t);
+      fogDensity = 0.015;
     } else {
-      // 🌙 NIGHT (08:00 PM - 05:00 AM) - Lunar silver moonlight, deep indigo sky
-      sunPos = new THREE.Vector3(-14, 22, -14);
-      sunColor = new THREE.Color(0x93c5fd); // Moonlight
-      sunIntensity = 0.42;
-      ambColor = new THREE.Color(0x1e293b);
-      ambIntensity = 0.38;
-      skyColor = new THREE.Color(0x0b132b);
-      fogColor = new THREE.Color(0x0f172a);
-      fogDensity = 0.024;
+      // 🌙 NIGHT (08:00 PM - 05:00 AM) - Crisp silver moonlight, deep starry night
+      this._tempSunPos.set(-14, 22, -14);
+      this._tempSunColor.setHex(0xbfdbfe);
+      sunIntensity = 0.62;
+      this._tempAmbColor.setHex(0x475569);
+      ambIntensity = 0.52;
+      this._tempSkyColor.setHex(0x0f172a);
+      this._tempFogColor.setHex(0x1e293b);
+      fogDensity = 0.016;
     }
 
     // Apply smoothly to Three.js lighting & scene
-    // Focus directional light and tight shadow box directly around player position
     this.sunLight.target.position.set(this.playerPos.x, this.playerPos.y, this.playerPos.z);
     this.sunLight.target.updateMatrixWorld();
     this.sunLight.position.set(
-      this.playerPos.x + sunPos.x,
-      this.playerPos.y + sunPos.y,
-      this.playerPos.z + sunPos.z
+      this.playerPos.x + this._tempSunPos.x,
+      this.playerPos.y + this._tempSunPos.y,
+      this.playerPos.z + this._tempSunPos.z
     );
-    this.sunLight.color.copy(sunColor);
+    this.sunLight.color.copy(this._tempSunColor);
     this.sunLight.intensity = sunIntensity;
-    this.ambientLight.color.copy(ambColor);
+    this.ambientLight.color.copy(this._tempAmbColor);
     this.ambientLight.intensity = ambIntensity;
+
+    if (this.hemiLight) {
+      this.hemiLight.color.copy(this._tempSkyColor);
+      this.hemiLight.groundColor.setHex(0x78350f);
+      this.hemiLight.intensity = THREE.MathUtils.lerp(0.45, 0.8, ambIntensity);
+    }
 
     const area = this.gameState.currentArea();
     if (area !== 'house' && area !== 'shop') {
-      this.scene.background = skyColor;
+      this.scene.background = this._tempSkyColor;
       if (this.scene.fog instanceof THREE.FogExp2) {
-        this.scene.fog.color.copy(fogColor);
+        this.scene.fog.color.copy(this._tempFogColor);
         this.scene.fog.density = fogDensity;
       }
     }
   }
 
-  // MAIN GAME TICK & ANIMATION LOOP
+  // MAIN GAME TICK & ANIMATION LOOP (Zero CPU when paused)
   private animate = (): void => {
+    if (!this.isLoopActive) return;
     this.animFrameId = requestAnimationFrame(this.animate);
     const delta = this.clock.getDelta();
+
+    // Dynamic shadow toggle check from settings
+    const shadowsOn = this.gameState.shadowsEnabled();
+    if (this.renderer && this.renderer.shadowMap.enabled !== shadowsOn) {
+      this.renderer.shadowMap.enabled = shadowsOn;
+      if (this.sunLight) this.sunLight.castShadow = shadowsOn;
+    }
 
     // Atmospheric lighting tick (Smooth day/night cycle & time of day updates)
     this.updateAtmosphericLighting();
@@ -2848,12 +3574,11 @@ export class World3dService {
       }
     }
 
-    // 3c. Fluffy green bushes gentle breeze breathing
-    if (this.bushMeshes.length > 0) {
-      const time = this.clock.getElapsedTime();
-      const swayTime = time * 1.5;
-      for (const bush of this.bushMeshes) {
-        bush.rotation.y += Math.sin(swayTime + bush.position.x * 0.3) * 0.001;
+    // 3d. River water flow animation (Flows FROM North Mountain Source DOWN TO South Ocean Cliff)
+    if (this.waterPlane && this.waterPlane.material) {
+      const mat = this.waterPlane.material as THREE.MeshStandardMaterial;
+      if (mat.map) {
+        mat.map.offset.y += delta * 0.18;
       }
     }
 
@@ -2863,11 +3588,22 @@ export class World3dService {
     // 5. Update Camera (Smooth lerp following player)
     this.updateCamera();
 
+    // 5b. Frustum Culling for 16x16m Vegetation Chunks (Hide off-screen chunks)
+    this.updateVegetationFrustumCulling();
+
     // 6. Proximity Check for All-in-One Action Button
     this.updateActionProximity();
 
-    // 7. Render
-    this.renderer.render(this.scene, this.camera);
+    // 7. Render (Direct or via Miniature Tilt-Shift Pass)
+    if (this.gameState.tiltShiftEnabled() && this.tiltShiftTarget && this.tiltShiftScene && this.tiltShiftCamera) {
+      this.renderer.setRenderTarget(this.tiltShiftTarget);
+      this.renderer.render(this.scene, this.camera);
+      this.renderer.setRenderTarget(null);
+      this.renderer.render(this.tiltShiftScene, this.tiltShiftCamera);
+    } else {
+      this.renderer.setRenderTarget(null);
+      this.renderer.render(this.scene, this.camera);
+    }
 
     // 8. Performance Telemetry Tracking
     this.frameCount++;
@@ -2890,8 +3626,27 @@ export class World3dService {
     }
   };
 
+  private updateVegetationFrustumCulling(): void {
+    if (this.vegetationChunks.length === 0) return;
+
+    this.projScreenMatrix.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
+    this.cameraFrustum.setFromProjectionMatrix(this.projScreenMatrix);
+
+    let visibleCount = 0;
+    for (const chunk of this.vegetationChunks) {
+      const isVisible = this.cameraFrustum.intersectsBox(chunk.bounds);
+      chunk.group.visible = isVisible;
+      if (isVisible) visibleCount++;
+    }
+    if (this.lastVisibleChunkCount !== visibleCount) {
+      this.lastVisibleChunkCount = visibleCount;
+      this.gameState.visibleChunks.set(visibleCount);
+    }
+  }
+
   private updatePlayerMovement(delta: number): void {
     if (this.gameState.isFading()) return;
+    if (this.gameState.isDevEditorOpen()) return; // Lock player movement in dev editor mode
 
     const vx = this.moveVector.x;
     const vz = this.moveVector.z;
@@ -2955,8 +3710,21 @@ export class World3dService {
         }
       }
 
-      // Continuous terrain elevation following (walk smoothly up and down hills)
+      // Continuous terrain elevation following & riverbank collision limit
       if (area === 'farm') {
+        // Prevent player from stepping directly into deep river water (except on wooden bridge decks)
+        // Using same formula as getTerrainHeight: rx = 21.0 + sin(z * 0.08) * 1.8
+        const riverX = 21.0 + Math.sin(this.playerPos.z * 0.08) * 1.8;
+        const distToRiver = Math.abs(this.playerPos.x - riverX);
+
+        const isOnBridge1 = Math.abs(this.playerPos.x - 21.0) < 3.1 && Math.abs(this.playerPos.z - 0.0) < 1.4;
+        const isOnBridge2 = Math.abs(this.playerPos.x - 19.5) < 4.4 && Math.abs(this.playerPos.z - (-12.5)) < 1.4;
+
+        if (distToRiver < 1.95 && !isOnBridge1 && !isOnBridge2) {
+          const pushSign = this.playerPos.x >= riverX ? 1 : -1;
+          this.playerPos.x = riverX + pushSign * 1.95;
+        }
+
         this.playerPos.y = this.getFarmHeight(this.playerPos.x, this.playerPos.z);
       } else {
         this.playerPos.y = 0;
@@ -2989,35 +3757,73 @@ export class World3dService {
     }
   }
 
-  // Camera tracking (Smooth, 100% steady camera without any pitch/yaw wobble or walking shake)
+  // Camera tracking (Authentic Harvest Moon: Tree of Tranquility hill elevation mechanic)
+  // When player climbs a hill/mountain (Y elevation rises), the camera's base height remains grounded/damped
+  // and tilts its pitch up to frame the character climbing upwards against the sky/hill
   private updateCamera(): void {
+    if (this.gameState.isPhotoModeOpen()) {
+      // Free Camera Orbit in Photo Mode
+      const focusX = this.photoFocus.x;
+      const focusY = this.photoFocus.y;
+      const focusZ = this.photoFocus.z;
+
+      const cosPitch = Math.cos(this.photoPitch);
+      this.camera.position.x = focusX + this.photoDistance * Math.sin(this.photoYaw) * cosPitch;
+      this.camera.position.y = focusY + this.photoDistance * Math.sin(this.photoPitch);
+      this.camera.position.z = focusZ + this.photoDistance * Math.cos(this.photoYaw) * cosPitch;
+
+      this.camera.lookAt(focusX, focusY, focusZ);
+      return;
+    }
+
     const targetX = this.playerPos.x;
-    const targetY = this.playerPos.y + 1.0;
+    const targetY = this.playerPos.y + 0.85;
     const targetZ = this.playerPos.z;
 
     const area = this.gameState.currentArea();
-    const camOffset = (area === 'house' || area === 'shop')
-      ? new THREE.Vector3(0, 7.5, 7.5)
-      : new THREE.Vector3(0, 8.5, 9.5);
+    const isInterior = (area === 'house' || area === 'shop');
+    const camOffset = isInterior
+      ? this._cachedCamOffsetHouse
+      : this._cachedCamOffsetOutdoor;
 
     // Smoothly track target point without phase delay
-    const target = new THREE.Vector3(targetX, targetY, targetZ);
-    this.camLookAtTarget.lerp(target, 0.15);
+    this._cachedCamTarget.set(targetX, targetY, targetZ);
+    this.camLookAtTarget.lerp(this._cachedCamTarget, 0.12);
 
-    // Lock camera position strictly to target + offset vector (Guarantees zero rotation wobble)
-    this.camera.position.copy(this.camLookAtTarget).add(camOffset);
+    if (isInterior) {
+      // Direct dollhouse cutaway interior tracking
+      this.camera.position.x = this.camLookAtTarget.x + camOffset.x;
+      this.camera.position.y = this.camLookAtTarget.y + camOffset.y;
+      this.camera.position.z = this.camLookAtTarget.z + camOffset.z;
+    } else {
+      // Tree of Tranquility outdoor hill mechanic:
+      // Camera X and Z follow player, while camera Y elevation is heavily dampened (28% climb)
+      // As a result, when player climbs a hill (Y > 0), the camera stays lower and tilts UP at the player!
+      const hillClimbFraction = 0.28;
+      this.camera.position.x = this.camLookAtTarget.x + camOffset.x;
+      this.camera.position.y = camOffset.y + Math.max(0, this.camLookAtTarget.y * hillClimbFraction);
+      this.camera.position.z = this.camLookAtTarget.z + camOffset.z;
+    }
+
     this.camera.lookAt(this.camLookAtTarget);
   }
 
   // Dynamic Contextual Proximity Detection (All-in-One Action Button)
   private updateActionProximity(): void {
+    // Throttle check to run once every 4 frames (15 Hz) to save CPU cycles
+    this.actionCheckTick = (this.actionCheckTick + 1) % 4;
+    if (this.actionCheckTick !== 0) return;
+
     const currentArea = this.gameState.currentArea();
     const currentTool = this.gameState.selectedTool();
+    const px = this.playerPos.x;
+    const pz = this.playerPos.z;
 
     // 1. Check fixed interactive markers (Doors, Signs, Bed, Well, Pier, Bells)
     for (const marker of this.interactiveMarkers) {
-      const dist = this.playerPos.distanceTo(marker.pos);
-      if (dist <= marker.radius) {
+      const dx = px - marker.pos.x;
+      const dz = pz - marker.pos.z;
+      if (dx * dx + dz * dz <= marker.radius * marker.radius) {
         this.gameState.currentAction.set(marker.context);
         return;
       }
@@ -3026,9 +3832,9 @@ export class World3dService {
     // 2. Check Animals (Farmstead area)
     if (currentArea === 'farm') {
       for (const a of this.gameState.animals()) {
-        const ay = this.getFarmHeight(a.position.x, a.position.z);
-        const animalPos = new THREE.Vector3(a.position.x, ay, a.position.z);
-        if (this.playerPos.distanceTo(animalPos) <= 2.2) {
+        const dx = px - a.position.x;
+        const dz = pz - a.position.z;
+        if (dx * dx + dz * dz <= 2.2 * 2.2) {
           this.gameState.currentAction.set({
             type: 'pet',
             label: a.pettedToday ? `ELUS / PET ${a.name}` : `RAWAT / CARE ${a.name}`,
@@ -3041,10 +3847,14 @@ export class World3dService {
       }
 
       // 3. Check Farm Plots (Soil tiles)
-      const origin = new THREE.Vector3(3.5, 0, 4);
+      const originX = 3.5;
+      const originZ = 4.0;
       for (const tile of this.gameState.farmPlots()) {
-        const tileWorldPos = new THREE.Vector3(origin.x + tile.x * 1.5, 0, origin.z + tile.z * 1.5);
-        if (this.playerPos.distanceTo(tileWorldPos) <= 1.4) {
+        const tileX = originX + tile.x * 1.5;
+        const tileZ = originZ + tile.z * 1.5;
+        const dx = px - tileX;
+        const dz = pz - tileZ;
+        if (dx * dx + dz * dz <= 1.4 * 1.4) {
           // Context depends on tile state & selected tool
           if (tile.crop && tile.crop.stage === 3) {
             // RIPE CROP -> HARVEST
@@ -3112,33 +3922,10 @@ export class World3dService {
   }
 
   // Helpers: Decorative trees, fences, signs
-  private createTree(pos: THREE.Vector3): void {
-    const tree = new THREE.Group();
-
-    // Contact AO Shadow
-    const shadow = WorldEnvironmentBuilder.createContactShadowAO(1.5);
-    shadow.position.y = 0.02;
-    tree.add(shadow);
-
-    // Trunk rooted into ground
-    const trunk = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.3, 0.45, 2.2, 8),
-      new THREE.MeshLambertMaterial({ color: 0x78350f })
-    );
-    trunk.position.y = 0.8;
-    tree.add(trunk);
-
-    const foliage = new THREE.Mesh(
-      new THREE.DodecahedronGeometry(1.4),
-      new THREE.MeshLambertMaterial({ color: 0x4ade80 })
-    );
-    foliage.position.y = 2.4;
-    tree.add(foliage);
-
-    this.enableShadows(tree);
-
+  private createTree(pos: THREE.Vector3, isFruitTree = false, fruitType: 'apple' | 'orange' = 'apple'): void {
     const ty = this.gameState.currentArea() === 'farm' ? this.getFarmHeight(pos.x, pos.z) : pos.y;
-    tree.position.set(pos.x, ty, pos.z);
+    const tree = WorldEnvironmentBuilder.createTree(new THREE.Vector3(pos.x, ty, pos.z), 1.0, isFruitTree, fruitType);
+    this.enableShadows(tree);
     tree.renderOrder = 3;
     this.areaGroup.add(tree);
   }
@@ -3418,6 +4205,15 @@ export class World3dService {
     }
   }
 
+  public enterPhotoMode(): void {
+    this.photoFocus.copy(this.playerPos);
+    // Offset focus slightly upwards so camera is centered on player's upper body
+    this.photoFocus.y += 0.85;
+    this.photoDistance = 14.0;
+    this.photoYaw = 0.0;
+    this.photoPitch = 0.65;
+  }
+
   public captureScreenshot(): string | null {
     if (!this.renderer || !this.scene || !this.camera) return null;
     try {
@@ -3429,12 +4225,248 @@ export class World3dService {
     }
   }
 
+  private buildEditorBrushRing(): void {
+    const ringGeo = new THREE.RingGeometry(0.95, 1.0, 32);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b, side: THREE.DoubleSide, transparent: true, opacity: 0.8 });
+    const mesh = new THREE.Mesh(ringGeo, ringMat);
+    this.editorBrushRing = mesh;
+    this.scene.add(mesh);
+  }
+
+  public updateEditorRaycast(mouseX: number, mouseY: number, isMouseDown: boolean): void {
+    if (!this.renderer || !this.scene || !this.camera || !this.terrainMesh) return;
+
+    this.mouse.set(mouseX, mouseY);
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+
+    const intersects = this.raycaster.intersectObject(this.terrainMesh);
+    if (intersects.length > 0) {
+      const hit = intersects[0].point;
+
+      if (!this.editorBrushRing) {
+        this.buildEditorBrushRing();
+      }
+      if (this.editorBrushRing) {
+        this.editorBrushRing.visible = true;
+        this.editorBrushRing.position.set(hit.x, hit.y + 0.05, hit.z);
+        const r = this.gameState.devBrushRadius();
+        this.editorBrushRing.scale.set(r, 1, r);
+      }
+
+      if (isMouseDown) {
+        const tool = this.gameState.devEditorTool();
+        if (tool === 'sculpt_raise' || tool === 'sculpt_lower') {
+          this.sculptTerrain(hit.x, hit.z, tool === 'sculpt_raise');
+        } else if (tool === 'place_prop') {
+          this.placeDevProp(hit.x, hit.z);
+        } else if (tool === 'delete_prop') {
+          this.deleteDevProp(hit.x, hit.z);
+        }
+      }
+    } else {
+      if (this.editorBrushRing) {
+        this.editorBrushRing.visible = false;
+      }
+    }
+  }
+
+  public sculptTerrain(centerX: number, centerZ: number, isRaise: boolean): void {
+    const radius = this.gameState.devBrushRadius();
+    const strength = this.gameState.devBrushStrength() * (isRaise ? 1 : -1) * 0.4;
+
+    for (let dx = -Math.ceil(radius); dx <= radius; dx++) {
+      for (let dz = -Math.ceil(radius); dz <= radius; dz++) {
+        const gx = Math.round(centerX + dx);
+        const gz = Math.round(centerZ + dz);
+        const dist = Math.hypot(gx - centerX, gz - centerZ);
+        if (dist <= radius) {
+          const factor = (1.0 - dist / radius);
+          const smoothFactor = factor * factor * (3.0 - 2.0 * factor);
+          const gridKey = `${gx},${gz}`;
+          const current = this.terrainHeightOffsets.get(gridKey) || 0;
+          this.terrainHeightOffsets.set(gridKey, current + strength * smoothFactor);
+        }
+      }
+    }
+
+    if (this.terrainMesh && this.terrainMesh.geometry) {
+      const geo = this.terrainMesh.geometry as THREE.BufferGeometry;
+      const posAttr = geo.attributes['position'];
+      for (let i = 0; i < posAttr.count; i++) {
+        const vx = posAttr.getX(i);
+        const vz = posAttr.getZ(i);
+        posAttr.setY(i, this.getFarmHeight(vx, vz));
+      }
+      posAttr.needsUpdate = true;
+      geo.computeVertexNormals();
+    }
+  }
+
+  public placeDevProp(x: number, z: number): void {
+    const near = this.devPlacedProps.some(p => Math.hypot(p.x - x, p.z - z) < 1.0);
+    if (near) return;
+
+    const propType = this.gameState.devSelectedProp();
+    const y = this.getFarmHeight(x, z);
+    let propMesh: THREE.Object3D | null = null;
+
+    if (propType === 'maple_tree') {
+      propMesh = WorldEnvironmentBuilder.createTree(new THREE.Vector3(x, y, z), 1.0, false);
+    } else if (propType === 'pine_tree') {
+      propMesh = WorldEnvironmentBuilder.createTree(new THREE.Vector3(x, y, z), 1.15, true);
+    } else if (propType === 'rustic_fence') {
+      const fenceGroup = new THREE.Group();
+      const woodMat = WorldEnvironmentBuilder.createGradientMaterial({
+        color: 0xca8a04,
+        bottomColor: 0x713f12,
+        topColor: 0xeab308,
+        minY: 0,
+        maxY: 1.2
+      });
+      const postGeo = new THREE.BoxGeometry(0.12, 1.1, 0.12);
+      const post1 = new THREE.Mesh(postGeo, woodMat); post1.position.set(-0.6, 0.55, 0); fenceGroup.add(post1);
+      const post2 = new THREE.Mesh(postGeo, woodMat); post2.position.set(0.6, 0.55, 0); fenceGroup.add(post2);
+      const railGeo = new THREE.BoxGeometry(1.3, 0.08, 0.08);
+      const rail1 = new THREE.Mesh(railGeo, woodMat); rail1.position.set(0, 0.8, 0); fenceGroup.add(rail1);
+      const rail2 = new THREE.Mesh(railGeo, woodMat); rail2.position.set(0, 0.4, 0); fenceGroup.add(rail2);
+      fenceGroup.position.set(x, y, z);
+      propMesh = fenceGroup;
+    } else if (propType === 'bench') {
+      const benchGroup = new THREE.Group();
+      const benchMat = WorldEnvironmentBuilder.createGradientMaterial({
+        color: 0xca8a04,
+        bottomColor: 0x854d0e,
+        topColor: 0xeab308,
+        minY: 0,
+        maxY: 1.0
+      });
+      const seat = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.08, 0.55), benchMat); seat.position.set(0, 0.4, 0); benchGroup.add(seat);
+      const back = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.38, 0.08), benchMat); back.position.set(0, 0.7, -0.25); benchGroup.add(back);
+      const legGeo = new THREE.BoxGeometry(0.08, 0.4, 0.08);
+      const leg1 = new THREE.Mesh(legGeo, benchMat); leg1.position.set(-0.65, 0.2, -0.22); benchGroup.add(leg1);
+      const leg2 = new THREE.Mesh(legGeo, benchMat); leg2.position.set(0.65, 0.2, -0.22); benchGroup.add(leg2);
+      const leg3 = new THREE.Mesh(legGeo, benchMat); leg3.position.set(-0.65, 0.2, 0.22); benchGroup.add(leg3);
+      const leg4 = new THREE.Mesh(legGeo, benchMat); leg4.position.set(0.65, 0.2, 0.22); benchGroup.add(leg4);
+      benchGroup.position.set(x, y, z);
+      propMesh = benchGroup;
+    } else if (propType === 'boulder') {
+      propMesh = WorldEnvironmentBuilder.createRock(new THREE.Vector3(x, y, z), 1.3);
+    }
+
+    if (propMesh) {
+      this.enableShadows(propMesh);
+      this.scene.add(propMesh);
+      this.devPlacedProps.push({ mesh: propMesh, type: propType, x, z });
+      this.audio.playPlant();
+    }
+  }
+
+  public deleteDevProp(x: number, z: number): void {
+    const idx = this.devPlacedProps.findIndex(p => Math.hypot(p.x - x, p.z - z) < 1.5);
+    if (idx !== -1) {
+      const p = this.devPlacedProps[idx];
+      this.scene.remove(p.mesh);
+      this.devPlacedProps.splice(idx, 1);
+      this.audio.playSelect();
+    }
+  }
+
+  public exitDevEditor(): void {
+    if (this.editorBrushRing) {
+      this.editorBrushRing.visible = false;
+    }
+    this.toggleDevGrid(false);
+  }
+
+  private editorGridHelper?: THREE.GridHelper;
+
+  public toggleDevGrid(visible: boolean): void {
+    if (!this.scene) return;
+
+    if (visible) {
+      if (!this.editorGridHelper) {
+        // Create 92m x 92m GridHelper with 92 divisions (1m per grid square)
+        this.editorGridHelper = new THREE.GridHelper(92, 92, 0xf59e0b, 0x475569);
+        this.editorGridHelper.position.set(0, 0.05, 0); // Slightly above water
+        (this.editorGridHelper.material as THREE.Material).transparent = true;
+        (this.editorGridHelper.material as THREE.Material).opacity = 0.42;
+      }
+      if (!this.scene.children.includes(this.editorGridHelper)) {
+        this.scene.add(this.editorGridHelper);
+      }
+      this.editorGridHelper.visible = true;
+    } else {
+      if (this.editorGridHelper) {
+        this.editorGridHelper.visible = false;
+      }
+    }
+  }
+
+  public exportMapData(): void {
+    const exportData = {
+      mapName: 'Solaria Custom Map',
+      exportedAt: new Date().toISOString(),
+      terrainHeightOffsets: Array.from(this.terrainHeightOffsets.entries()),
+      placedProps: this.devPlacedProps.map(p => ({ type: p.type, x: p.x, z: p.z }))
+    };
+
+    try {
+      const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+      const link = document.createElement('a');
+      link.download = `Solaria_Map_${Date.now()}.json`;
+      link.href = URL.createObjectURL(blob);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      this.gameState.showToast('📥 Peta berhasil diekspor sebagai JSON!');
+    } catch {
+      this.gameState.showToast('Gagal mengekspor data peta.');
+    }
+  }
+
+  public importMapData(jsonString: string): void {
+    try {
+      const data = JSON.parse(jsonString);
+      if (data.terrainHeightOffsets) {
+        this.terrainHeightOffsets = new Map(data.terrainHeightOffsets);
+      }
+      this.devPlacedProps.forEach(p => this.scene.remove(p.mesh));
+      this.devPlacedProps = [];
+
+      if (data.placedProps) {
+        data.placedProps.forEach((p: { type: string; x: number; z: number }) => {
+          this.gameState.devSelectedProp.set(p.type);
+          this.placeDevProp(p.x, p.z);
+        });
+      }
+
+      if (this.terrainMesh && this.terrainMesh.geometry) {
+        const geo = this.terrainMesh.geometry as THREE.BufferGeometry;
+        const posAttr = geo.attributes['position'];
+        for (let i = 0; i < posAttr.count; i++) {
+          const vx = posAttr.getX(i);
+          const vz = posAttr.getZ(i);
+          posAttr.setY(i, this.getFarmHeight(vx, vz));
+        }
+        posAttr.needsUpdate = true;
+        geo.computeVertexNormals();
+      }
+
+      this.gameState.showToast('📥 Peta kustom berhasil dimuat!');
+    } catch {
+      this.gameState.showToast('Gagal mengimpor file JSON peta.');
+    }
+  }
+
   // =========================================================================
   // PROCEDURAL TEXTURE GENERATORS (Modular & High Definition)
   // =========================================================================
   private initTextures(): void {
-    const tex = WorldTexturesGenerator.createTextureSet();
+    const tex = this.assetCache.getLoadedTextureSet();
     if (tex.grassTexture) this.grassTexture = tex.grassTexture;
+    if (tex.soilGroundTexture) this.soilGroundTexture = tex.soilGroundTexture;
+    if (tex.noiseTexture) this.noiseTexture = tex.noiseTexture;
     if (tex.roadTexture) this.roadTexture = tex.roadTexture;
     if (tex.roadEastTexture) this.roadEastTexture = tex.roadEastTexture;
     if (tex.townGroundTexture) this.townGroundTexture = tex.townGroundTexture;

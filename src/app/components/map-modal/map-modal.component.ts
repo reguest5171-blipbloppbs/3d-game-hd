@@ -195,23 +195,37 @@ interface MapAreaNode {
               </div>
             </div>
 
-            <!-- Right: Copy Button -->
-            <button
-              type="button"
-              (click)="copyCoordinates()"
-              class="px-3 py-1.5 rounded-xl border flex items-center gap-1.5 text-xs font-black transition-all active:scale-95 cursor-pointer shadow"
-              [class.border-emerald-400]="copied()"
-              [class.bg-emerald-600]="copied()"
-              [class.text-white]="copied()"
-              [class.border-amber-400/50]="!copied()"
-              [class.bg-amber-500/20]="!copied()"
-              [class.hover:bg-amber-500/30]="!copied()"
-              [class.text-amber-300]="!copied()"
-              title="Salin Koordinat (X, Y Ketinggian, Z) ke Clipboard"
-            >
-              <mat-icon class="text-sm">{{ copied() ? 'check_circle' : 'content_copy' }}</mat-icon>
-              <span>{{ copied() ? 'Tersalin!' : 'Salin Koordinat' }}</span>
-            </button>
+            <!-- Right Actions Container -->
+            <div class="flex items-center gap-1.5 shrink-0">
+              <!-- Dev Editor Switch Button -->
+              <button
+                type="button"
+                (click)="openDevEditor()"
+                class="px-3 py-1.5 rounded-xl border border-amber-400 bg-amber-500 hover:bg-amber-600 text-white active:scale-95 text-xs font-black flex items-center gap-1.5 cursor-pointer shadow focus:outline-none"
+                title="Buka Alat Sculpting & Editor Objek (Dev Mode)"
+              >
+                <mat-icon class="text-sm">handyman</mat-icon>
+                <span>Map Editor</span>
+              </button>
+
+              <!-- Copy Coordinates Button -->
+              <button
+                type="button"
+                (click)="copyCoordinates()"
+                class="px-3 py-1.5 rounded-xl border flex items-center gap-1.5 text-xs font-black transition-all active:scale-95 cursor-pointer shadow focus:outline-none"
+                [class.border-emerald-400]="copied()"
+                [class.bg-emerald-600]="copied()"
+                [class.text-white]="copied()"
+                [class.border-amber-400/50]="!copied()"
+                [class.bg-amber-500/20]="!copied()"
+                [class.hover:bg-amber-500/30]="!copied()"
+                [class.text-amber-300]="!copied()"
+                title="Salin Koordinat (X, Y Ketinggian, Z) ke Clipboard"
+              >
+                <mat-icon class="text-sm">{{ copied() ? 'check_circle' : 'content_copy' }}</mat-icon>
+                <span>{{ copied() ? 'Tersalin!' : 'Salin' }}</span>
+              </button>
+            </div>
           </div>
 
           <!-- Selected Area Detail Card -->
@@ -334,6 +348,11 @@ export class MapModalComponent {
       this.gameState.showToast('Gagal menyalin koordinat.');
     }
     document.body.removeChild(ta);
+  }
+
+  public openDevEditor(): void {
+    this.gameState.isMapOpen.set(false);
+    this.gameState.isDevEditorOpen.set(true);
   }
 
   public close(): void {

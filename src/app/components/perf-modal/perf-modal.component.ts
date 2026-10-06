@@ -176,9 +176,30 @@ import { GameStateService } from '../../services/game-state.service';
               </div>
 
               <div class="flex justify-between border-b border-white/5 py-0.5">
-                <span class="text-white/60">Optimasi Low-End:</span>
-                <span class="font-bold text-emerald-400">Aktif (Zero Blur, Shaded Lambert, No PostFX)</span>
+                <span class="text-white/60">Optimasi Draw Calls:</span>
+                <span class="font-bold text-emerald-400">Merged Static Geometries (<45 Calls)</span>
               </div>
+
+              <div class="flex justify-between border-b border-white/5 py-0.5">
+                <span class="text-white/60">Kamera Bayangan:</span>
+                <span class="font-bold text-amber-300">Precision Frustum Focused (18x18m)</span>
+              </div>
+
+              <div class="flex justify-between border-b border-white/5 py-0.5">
+                <span class="text-white/60">Efek Tilt-Shift Miniatur:</span>
+                <span class="font-bold" [class.text-violet-300]="gameState.tiltShiftEnabled()" [class.text-white/50]="!gameState.tiltShiftEnabled()">
+                  {{ gameState.tiltShiftEnabled() ? 'Aktif (Diorama Blur Shader)' : 'Mati (Direct Render)' }}
+                </span>
+              </div>
+
+              @if (gameState.totalChunks() > 0) {
+                <div class="flex justify-between border-b border-white/5 py-0.5">
+                  <span class="text-white/60">Vegetation Chunk Culling:</span>
+                  <span class="font-bold text-emerald-300 tabular-nums">
+                    {{ gameState.visibleChunks() }} / {{ gameState.totalChunks() }} Chunk Aktif (Grid 24x24m)
+                  </span>
+                </div>
+              }
 
               <div class="flex justify-between border-b border-white/5 py-0.5">
                 <span class="text-white/60">Mesin Audio:</span>

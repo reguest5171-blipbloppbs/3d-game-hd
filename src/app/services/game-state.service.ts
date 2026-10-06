@@ -80,6 +80,15 @@ export class GameStateService {
   // Player 3D Coordinates & Altitude (X, Y / Elevation, Z)
   public playerCoords = signal<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 2.5 });
 
+  // Fullscreen Landscape Guard & Zero CPU State (Requirement)
+  public isFullscreenLandscape = signal<boolean>(false);
+  public isGamePaused = signal<boolean>(true);
+  public isAppLoading = signal<boolean>(true);
+  public assetLoadingProgress = signal<number>(0);
+  public assetLoadingStage = signal<string>('Memulai...');
+  public assetLoadingDetail = signal<string>('Menyiapkan...');
+  public isAssetsCachedLocally = signal<boolean>(false);
+
   // Transitions & Modals
   public isFading = signal<boolean>(false);
   public fadeMessage = signal<string>('');
@@ -91,6 +100,13 @@ export class GameStateService {
   public isSettingsOpen = signal<boolean>(false);
   public isPerfModalOpen = signal<boolean>(false);
   public isToolMenuOpen = signal<boolean>(false);
+  public isPhotoModeOpen = signal<boolean>(false);
+  public isDevEditorOpen = signal<boolean>(false);
+  public isDevGridVisible = signal<boolean>(false);
+  public devEditorTool = signal<'sculpt_raise' | 'sculpt_lower' | 'place_prop' | 'delete_prop'>('sculpt_raise');
+  public devSelectedProp = signal<string>('maple_tree');
+  public devBrushRadius = signal<number>(2.5);
+  public devBrushStrength = signal<number>(0.3);
   public sleepSummary = signal<{ day: number; earned: number; itemsSold: number } | null>(null);
 
   // Performance Telemetry Signals
@@ -100,6 +116,8 @@ export class GameStateService {
   public frameTimeMs = signal<number>(16.6);
   public geometriesCount = signal<number>(0);
   public texturesCount = signal<number>(0);
+  public totalChunks = signal<number>(0);
+  public visibleChunks = signal<number>(0);
   public gpuInfo = signal<string>('Standard WebGL');
 
   // Customizable Settings for Controls & HUD (Requirement)
@@ -109,6 +127,8 @@ export class GameStateService {
   public joystickOffsetY = signal<number>(0); // -40 .. 40 px
   public actionOffsetX = signal<number>(0); // -40 .. 40 px
   public actionOffsetY = signal<number>(0); // -40 .. 40 px
+  public shadowsEnabled = signal<boolean>(true);
+  public tiltShiftEnabled = signal<boolean>(false);
 
   // Notifications
   public toastMessage = signal<string | null>(null);

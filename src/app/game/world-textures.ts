@@ -2,12 +2,15 @@ import * as THREE from 'three';
 
 export interface WorldTextureSet {
   grassTexture: THREE.CanvasTexture | null;
+  soilGroundTexture: THREE.CanvasTexture | null;
+  noiseTexture: THREE.CanvasTexture | null;
   roadTexture: THREE.CanvasTexture | null;
   roadEastTexture: THREE.CanvasTexture | null;
   townGroundTexture: THREE.CanvasTexture | null;
   woodFloorTexture: THREE.CanvasTexture | null;
   soilTilledTexture: THREE.CanvasTexture | null;
   soilWateredTexture: THREE.CanvasTexture | null;
+  waterTexture: THREE.CanvasTexture | null;
 }
 
 export class WorldTexturesGenerator {
@@ -15,23 +18,29 @@ export class WorldTexturesGenerator {
     if (typeof document === 'undefined') {
       return {
         grassTexture: null,
+        soilGroundTexture: null,
+        noiseTexture: null,
         roadTexture: null,
         roadEastTexture: null,
         townGroundTexture: null,
         woodFloorTexture: null,
         soilTilledTexture: null,
-        soilWateredTexture: null
+        soilWateredTexture: null,
+        waterTexture: null
       };
     }
 
     return {
       grassTexture: this.createGrassCanvasTexture(),
+      soilGroundTexture: this.createSoilGroundCanvasTexture(),
+      noiseTexture: this.createNoiseCanvasTexture(),
       roadTexture: this.createRoadCanvasTexture(false),
       roadEastTexture: this.createRoadCanvasTexture(true),
       townGroundTexture: this.createTownCanvasTexture(),
       woodFloorTexture: this.createWoodFloorCanvasTexture(),
       soilTilledTexture: this.createSoilCanvasTexture(false),
-      soilWateredTexture: this.createSoilCanvasTexture(true)
+      soilWateredTexture: this.createSoilCanvasTexture(true),
+      waterTexture: this.createWaterCanvasTexture()
     };
   }
 
@@ -58,28 +67,172 @@ export class WorldTexturesGenerator {
     ctx.closePath();
   }
 
-  // 1. LUSH MEADOW GRASS (Variegated Multi-Tone Micro-Grain Texture)
+  // 1. ISOTROPIC LUSH MEADOW GRASS (Velvety, Smooth, Zero Line Strokes or Streaks)
   public static createGrassCanvasTexture(): THREE.CanvasTexture {
     const canvas = document.createElement('canvas');
     canvas.width = 512;
     canvas.height = 512;
     const ctx = canvas.getContext('2d')!;
 
-    // Uniform neutral base (zero edge gradient for seamless tiling)
-    ctx.fillStyle = '#ffffff';
+    // Uniform lush, vibrant pastel meadow green base (Tree of Tranquility style)
+    ctx.fillStyle = '#6ecb32';
     ctx.fillRect(0, 0, 512, 512);
 
-    // Subtle multi-tonal marbling & organic macro turf variation (wrapped)
-    const offsets = [[0, 0], [512, 0], [-512, 0], [0, 512], [0, -512], [512, 512], [-512, -512], [512, -512], [-512, 512]];
+    const offsets = [
+      [0, 0], [512, 0], [-512, 0], [0, 512], [0, -512],
+      [512, 512], [-512, -512], [512, -512], [-512, 512]
+    ];
 
-    for (let i = 0; i < 35; i++) {
-      const cx = (i * 157 + 31) % 512;
-      const cy = (i * 211 + 73) % 512;
-      const rad = 45 + (i % 5) * 25;
+    // Soft isotropic round turf clusters (seamless radial gradients, zero directional lines)
+    for (let i = 0; i < 220; i++) {
+      const cx = (i * 137 + 19) % 512;
+      const cy = (i * 223 + 47) % 512;
+      const rad = 14 + (i % 5) * 8;
       const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
       const isWarm = i % 3 === 0;
-      const isDark = i % 3 === 1;
-      grad.addColorStop(0, isWarm ? 'rgba(254, 240, 138, 0.18)' : (isDark ? 'rgba(20, 83, 45, 0.14)' : 'rgba(134, 239, 172, 0.16)'));
+      const isCool = i % 3 === 1;
+      grad.addColorStop(0, isWarm ? 'rgba(154, 230, 70, 0.28)' : (isCool ? 'rgba(74, 168, 30, 0.22)' : 'rgba(130, 215, 55, 0.24)'));
+      grad.addColorStop(1, 'rgba(110, 203, 50, 0)');
+      ctx.fillStyle = grad;
+
+      for (const [ox, oy] of offsets) {
+        ctx.beginPath();
+        ctx.arc(cx + ox, cy + oy, rad, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Dense micro-stippling for velvety turf grain (pure soft circular particles)
+    for (let i = 0; i < 2400; i++) {
+      const cx = (i * 73 + 31) % 512;
+      const cy = (i * 179 + 53) % 512;
+      const r = 0.8 + (i % 3) * 0.6;
+      ctx.fillStyle = (i % 2 === 0) ? 'rgba(195, 245, 120, 0.35)' : 'rgba(55, 140, 25, 0.18)';
+
+      for (const [ox, oy] of offsets) {
+        ctx.beginPath();
+        ctx.arc(cx + ox, cy + oy, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Multi-petal Chamomile flower clusters & 3-leaf Clover patches
+    const petalColors = ['rgba(255, 255, 255, 0.90)', 'rgba(254, 240, 138, 0.85)', 'rgba(251, 207, 232, 0.75)'];
+    for (let i = 0; i < 45; i++) {
+      const cx = (i * 281 + 71) % 512;
+      const cy = (i * 353 + 97) % 512;
+      const flowerColor = petalColors[i % petalColors.length];
+
+      for (const [ox, oy] of offsets) {
+        // Chamomile center yellow core
+        ctx.fillStyle = 'rgba(245, 158, 11, 0.95)';
+        ctx.beginPath();
+        ctx.arc(cx + ox, cy + oy, 1.4, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 4 surrounding white petals
+        ctx.fillStyle = flowerColor;
+        for (let p = 0; p < 4; p++) {
+          const angle = (p * Math.PI) / 2;
+          const px = cx + ox + Math.cos(angle) * 2.2;
+          const py = cy + oy + Math.sin(angle) * 2.2;
+          ctx.beginPath();
+          ctx.arc(px, py, 1.2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    // 3-leaf Clover patches (deep emerald 3-petal groupings)
+    ctx.fillStyle = 'rgba(22, 101, 52, 0.40)';
+    for (let i = 0; i < 65; i++) {
+      const gx = (i * 193 + 43) % 512;
+      const gy = (i * 277 + 83) % 512;
+
+      for (const [ox, oy] of offsets) {
+        for (let p = 0; p < 3; p++) {
+          const angle = (p * Math.PI * 2) / 3;
+          const px = gx + ox + Math.cos(angle) * 1.8;
+          const py = gy + oy + Math.sin(angle) * 1.8;
+          ctx.beginPath();
+          ctx.arc(px, py, 1.3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(12, 12);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  }
+
+  // 1D. CRYSTAL AZURE WATER SURFACE TEXTURE WITH MOVING FLOW RIPPLES
+  public static createWaterCanvasTexture(): THREE.CanvasTexture {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512;
+    canvas.height = 512;
+    const ctx = canvas.getContext('2d')!;
+
+    // Azure blue base
+    ctx.fillStyle = '#0ea5e9';
+    ctx.fillRect(0, 0, 512, 512);
+
+    const offsets = [
+      [0, 0], [512, 0], [-512, 0], [0, 512], [0, -512],
+      [512, 512], [-512, -512], [512, -512], [-512, 512]
+    ];
+
+    // Soft water caustics & gentle flow ripples
+    for (let i = 0; i < 160; i++) {
+      const cx = (i * 137 + 19) % 512;
+      const cy = (i * 223 + 47) % 512;
+      const rx = 18 + (i % 5) * 12;
+      const ry = 6 + (i % 3) * 4;
+
+      ctx.fillStyle = (i % 2 === 0) ? 'rgba(224, 242, 254, 0.40)' : 'rgba(2, 132, 199, 0.35)';
+
+      for (const [ox, oy] of offsets) {
+        ctx.beginPath();
+        ctx.ellipse(cx + ox, cy + oy, rx, ry, Math.PI / 6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(2, 12);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  }
+
+  // 1B. RICH ORGANIC GROUND SOIL / EARTH TEXTURE (Tanah Alami)
+  public static createSoilGroundCanvasTexture(): THREE.CanvasTexture {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512;
+    canvas.height = 512;
+    const ctx = canvas.getContext('2d')!;
+
+    // Warm natural earth baseline
+    ctx.fillStyle = '#f5ede0';
+    ctx.fillRect(0, 0, 512, 512);
+
+    const offsets = [
+      [0, 0], [512, 0], [-512, 0], [0, 512], [0, -512],
+      [512, 512], [-512, -512], [512, -512], [-512, 512]
+    ];
+
+    // Soft humus loam variations (small crumb clusters)
+    for (let i = 0; i < 160; i++) {
+      const cx = (i * 149 + 29) % 512;
+      const cy = (i * 211 + 61) % 512;
+      const rad = 14 + (i % 4) * 9;
+      const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
+      const isDark = i % 2 === 0;
+      grad.addColorStop(0, isDark ? 'rgba(120, 75, 35, 0.16)' : 'rgba(215, 175, 125, 0.18)');
       grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
       ctx.fillStyle = grad;
 
@@ -90,12 +243,15 @@ export class WorldTexturesGenerator {
       }
     }
 
-    // Micro-stippling / fine turf grain with full offset wrapping
-    for (let i = 0; i < 900; i++) {
-      const cx = (i * 137 + 23) % 512;
-      const cy = (i * 229 + 47) % 512;
-      const r = 1.0 + (i % 3) * 0.6;
-      ctx.fillStyle = (i % 2 === 0) ? 'rgba(255, 255, 255, 0.40)' : 'rgba(0, 0, 0, 0.08)';
+    // Dense soil crumbs, fine sand grains and humus particles
+    for (let i = 0; i < 2800; i++) {
+      const cx = (i * 67 + 23) % 512;
+      const cy = (i * 191 + 43) % 512;
+      const r = 0.7 + (i % 4) * 0.55;
+      const mode = i % 3;
+      ctx.fillStyle = (mode === 0)
+        ? 'rgba(255, 255, 255, 0.45)'
+        : ((mode === 1) ? 'rgba(90, 55, 25, 0.22)' : 'rgba(45, 25, 10, 0.14)');
 
       for (const [ox, oy] of offsets) {
         ctx.beginPath();
@@ -104,34 +260,16 @@ export class WorldTexturesGenerator {
       }
     }
 
-    // Delicate grass blade micro-fibers
-    for (let i = 0; i < 1400; i++) {
-      const bx = (i * 73 + 17) % 512;
-      const by = (i * 193 + 31) % 512;
-      const len = 3.5 + (i % 4) * 1.5;
-      const angle = -Math.PI / 2 + ((i % 7) - 3) * 0.1;
-
-      ctx.strokeStyle = (i % 3 === 0) ? 'rgba(255, 255, 255, 0.35)' : ((i % 3 === 1) ? 'rgba(0, 0, 0, 0.06)' : 'rgba(0, 0, 0, 0.12)');
-      ctx.lineWidth = 1.0;
+    // Micro pebble flecks
+    for (let i = 0; i < 350; i++) {
+      const px = (i * 173 + 37) % 512;
+      const py = (i * 239 + 79) % 512;
+      const pr = 1.3 + (i % 3) * 0.8;
+      ctx.fillStyle = (i % 2 === 0) ? 'rgba(215, 205, 190, 0.60)' : 'rgba(140, 115, 90, 0.40)';
 
       for (const [ox, oy] of offsets) {
         ctx.beginPath();
-        ctx.moveTo(bx + ox, by + oy);
-        ctx.lineTo(bx + ox + Math.cos(angle) * len, by + oy + Math.sin(angle) * len);
-        ctx.stroke();
-      }
-    }
-
-    // Subtle micro-clover / meadow flower dots
-    const flowerColors = ['rgba(255, 255, 255, 0.85)', 'rgba(254, 240, 138, 0.8)', 'rgba(250, 204, 21, 0.75)', 'rgba(244, 114, 182, 0.7)'];
-    for (let i = 0; i < 85; i++) {
-      const fx = (i * 283 + 61) % 512;
-      const fy = (i * 359 + 89) % 512;
-      ctx.fillStyle = flowerColors[i % flowerColors.length];
-
-      for (const [ox, oy] of offsets) {
-        ctx.beginPath();
-        ctx.arc(fx + ox, fy + oy, 1.2, 0, Math.PI * 2);
+        ctx.arc(px + ox, py + oy, pr, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -139,8 +277,53 @@ export class WorldTexturesGenerator {
     const texture = new THREE.CanvasTexture(canvas);
     texture.wrapS = THREE.RepeatWrapping;
     texture.wrapT = THREE.RepeatWrapping;
-    texture.repeat.set(50, 50);
+    texture.repeat.set(1, 1);
     texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  }
+
+  // 1C. SEAMLESS ORGANIC NOISE TEXTURE FOR HARDWARE-ACCELERATED SHADER BLENDING
+  public static createNoiseCanvasTexture(): THREE.CanvasTexture {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 256;
+    const ctx = canvas.getContext('2d')!;
+
+    const imgData = ctx.createImageData(256, 256);
+    const data = imgData.data;
+
+    const size = 256;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const u = (x / size) * Math.PI * 2;
+        const v = (y / size) * Math.PI * 2;
+
+        const nx = Math.cos(u);
+        const ny = Math.sin(u);
+        const nz = Math.cos(v);
+        const nw = Math.sin(v);
+
+        let val = Math.sin(nx * 2.5 + nz * 2.0) * 0.45 +
+                  Math.cos(ny * 3.0 + nw * 2.5) * 0.35 +
+                  Math.sin((nx + ny) * 5.0 + (nz - nw) * 4.5) * 0.20;
+
+        val = Math.max(0, Math.min(1, (val + 1.0) * 0.5));
+        const byteVal = Math.floor(val * 255);
+
+        const idx = (y * size + x) * 4;
+        data[idx] = byteVal;
+        data[idx + 1] = byteVal;
+        data[idx + 2] = byteVal;
+        data[idx + 3] = 255;
+      }
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(1, 1);
     return texture;
   }
 
@@ -151,29 +334,58 @@ export class WorldTexturesGenerator {
     canvas.height = 512;
     const ctx = canvas.getContext('2d')!;
 
-    // 1. Warm Rustic Compacted Earth Base (Natural warm soil)
-    ctx.fillStyle = '#c5ac86';
+    // Clear transparent background
+    ctx.clearRect(0, 0, 512, 512);
+
+    // 1. Warm Rustic Compacted Earth Base with Feathered Alpha Edges (Seamless Grass Blending)
+    const baseGrad = horizontal
+      ? ctx.createLinearGradient(0, 0, 0, 512)
+      : ctx.createLinearGradient(0, 0, 512, 0);
+
+    baseGrad.addColorStop(0.00, 'rgba(197, 172, 134, 0)');
+    baseGrad.addColorStop(0.12, 'rgba(197, 172, 134, 0.35)');
+    baseGrad.addColorStop(0.24, 'rgba(210, 188, 152, 0.88)');
+    baseGrad.addColorStop(0.50, 'rgba(225, 205, 170, 0.98)');
+    baseGrad.addColorStop(0.76, 'rgba(210, 188, 152, 0.88)');
+    baseGrad.addColorStop(0.88, 'rgba(197, 172, 134, 0.35)');
+    baseGrad.addColorStop(1.00, 'rgba(197, 172, 134, 0)');
+
+    ctx.fillStyle = baseGrad;
     ctx.fillRect(0, 0, 512, 512);
 
-    // Natural soil crumbs, earth patches & fine sand grains
-    for (let i = 0; i < 750; i++) {
-      const px = (i * 73 + 19) % 512;
-      const py = (i * 127 + 41) % 512;
+    // Natural soil crumbs, earth patches & fine sand grains (feathered along path corridor)
+    for (let i = 0; i < 600; i++) {
+      let px = (i * 73 + 19) % 512;
+      let py = (i * 127 + 41) % 512;
+
+      // Keep particles inside the feathered pathway corridor
+      if (!horizontal) {
+        px = 80 + (px % 352);
+      } else {
+        py = 80 + (py % 352);
+      }
+
       ctx.fillStyle = (i % 3 === 0)
-        ? 'rgba(240, 225, 195, 0.55)'
-        : ((i % 3 === 1) ? 'rgba(145, 110, 75, 0.40)' : 'rgba(95, 65, 35, 0.30)');
+        ? 'rgba(245, 230, 200, 0.55)'
+        : ((i % 3 === 1) ? 'rgba(145, 110, 75, 0.35)' : 'rgba(95, 65, 35, 0.25)');
       ctx.beginPath();
-      ctx.arc(px, py, 0.8 + (i % 3) * 0.7, 0, Math.PI * 2);
+      ctx.arc(px, py, 0.8 + (i % 3) * 0.6, 0, Math.PI * 2);
       ctx.fill();
     }
 
     // Soft organic soil variation patches
-    for (let i = 0; i < 22; i++) {
-      const cx = (i * 97 + 23) % 512;
-      const cy = (i * 139 + 37) % 512;
-      const r = 25 + (i % 4) * 14;
+    for (let i = 0; i < 16; i++) {
+      let cx = (i * 97 + 23) % 512;
+      let cy = (i * 139 + 37) % 512;
+      if (!horizontal) {
+        cx = 120 + (cx % 272);
+      } else {
+        cy = 120 + (cy % 272);
+      }
+
+      const r = 20 + (i % 4) * 12;
       const pGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
-      pGrad.addColorStop(0, i % 2 === 0 ? 'rgba(215, 190, 150, 0.35)' : 'rgba(155, 125, 85, 0.28)');
+      pGrad.addColorStop(0, i % 2 === 0 ? 'rgba(215, 190, 150, 0.30)' : 'rgba(155, 125, 85, 0.22)');
       pGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
       ctx.fillStyle = pGrad;
       ctx.beginPath();

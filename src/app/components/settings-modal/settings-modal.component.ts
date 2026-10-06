@@ -80,6 +80,60 @@ import { GameStateService } from '../../services/game-state.service';
             </div>
           </div>
 
+          <!-- Section 1B: Mode Grafis & Bayangan Dinamis (60 FPS Performance Mode) -->
+          <div class="p-3.5 rounded-2xl border border-white/15 bg-white/5 flex flex-col gap-2.5">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2 text-xs font-bold text-white">
+                <mat-icon class="text-amber-400 text-lg">wb_sunny</mat-icon>
+                <span>Bayangan Dinamis Matahari</span>
+              </div>
+              <button
+                (click)="toggleShadows()"
+                class="px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors flex items-center gap-1.5"
+                [class.border-emerald-400]="isShadowsOn()"
+                [class.bg-emerald-500/25]="isShadowsOn()"
+                [class.text-emerald-300]="isShadowsOn()"
+                [class.border-sky-400]="!isShadowsOn()"
+                [class.bg-sky-500/25]="!isShadowsOn()"
+                [class.text-sky-300]="!isShadowsOn()"
+              >
+                <mat-icon class="text-sm">{{ isShadowsOn() ? 'wb_sunny' : 'bolt' }}</mat-icon>
+                <span>{{ isShadowsOn() ? 'AKTIF (Shadow Map)' : 'HEMAT (Ultra 60 FPS)' }}</span>
+              </button>
+            </div>
+
+            <div class="text-[11px] text-white/60">
+              {{ isShadowsOn() ? 'Rendering bayangan dinamis aktif dengan kamera bayangan presisi.' : 'Mode Hemat: Menggunakan bayangan kontak artistik bebas lag, sangat lancar untuk HP low-end.' }}
+            </div>
+          </div>
+
+          <!-- Section 1C: Efek Tilt-Shift / Diorama Miniatur (Aesthetic Depth) -->
+          <div class="p-3.5 rounded-2xl border border-white/15 bg-white/5 flex flex-col gap-2.5">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2 text-xs font-bold text-white">
+                <mat-icon class="text-violet-400 text-lg">blur_linear</mat-icon>
+                <span>Efek Tilt-Shift Miniatur</span>
+              </div>
+              <button
+                (click)="toggleTiltShift()"
+                class="px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors flex items-center gap-1.5"
+                [class.border-violet-400]="isTiltShiftOn()"
+                [class.bg-violet-500/25]="isTiltShiftOn()"
+                [class.text-violet-300]="isTiltShiftOn()"
+                [class.border-slate-500]="!isTiltShiftOn()"
+                [class.bg-white/10]="!isTiltShiftOn()"
+                [class.text-white/70]="!isTiltShiftOn()"
+              >
+                <mat-icon class="text-sm">{{ isTiltShiftOn() ? 'camera' : 'blur_off' }}</mat-icon>
+                <span>{{ isTiltShiftOn() ? 'AKTIF (Diorama Blur)' : 'MATI (Off)' }}</span>
+              </button>
+            </div>
+
+            <div class="text-[11px] text-white/60">
+              Efek blur halus di tepi atas dan bawah layar menggunakan fragment shader untuk visual miniature aesthetic ala Tree of Tranquility.
+            </div>
+          </div>
+
           <!-- Section 2: Transparansi HUD & Kontroler (Opacity Adjust) -->
           <div class="p-3.5 rounded-2xl border border-white/15 bg-white/5 flex flex-col gap-2">
             <div class="flex items-center justify-between">
@@ -158,6 +212,31 @@ import { GameStateService } from '../../services/game-state.service';
               >
                 Ekstra (130%)
               </button>
+            </div>
+          </div>
+
+          <!-- Section 3B: Developer Mode / Map Editor (Dev Mode) -->
+          <div class="p-3.5 rounded-2xl border border-amber-500/30 bg-amber-950/10 flex flex-col gap-2.5">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2 text-xs font-bold text-amber-300">
+                <mat-icon class="text-amber-400 text-lg">construction</mat-icon>
+                <span>Developer Map Terrain Editor</span>
+              </div>
+              <button
+                (click)="toggleDevEditor()"
+                class="px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors flex items-center gap-1.5 cursor-pointer"
+                [class.border-amber-400]="gameState.isDevEditorOpen()"
+                [class.bg-amber-500/25]="gameState.isDevEditorOpen()"
+                [class.text-amber-300]="gameState.isDevEditorOpen()"
+                [class.border-white/20]="!gameState.isDevEditorOpen()"
+                [class.text-white/60]="!gameState.isDevEditorOpen()"
+              >
+                <mat-icon class="text-sm">{{ gameState.isDevEditorOpen() ? 'build' : 'close' }}</mat-icon>
+                <span>{{ gameState.isDevEditorOpen() ? 'AKTIF (ON)' : 'MATI (OFF)' }}</span>
+              </button>
+            </div>
+            <div class="text-[11px] text-white/60">
+              Aktifkan editor medan tanah 3D untuk memahat ketinggian tanah (*sculpting*) serta menaruh objek dekorasi secara langsung di Pulau Solaria.
             </div>
           </div>
 
@@ -272,6 +351,24 @@ export class SettingsModalComponent {
     this.audio.playHarvest();
   }
 
+  public isShadowsOn(): boolean {
+    return this.gameState.shadowsEnabled();
+  }
+
+  public toggleShadows(): void {
+    this.gameState.shadowsEnabled.update((v) => !v);
+    this.gameState.saveSettings();
+  }
+
+  public isTiltShiftOn(): boolean {
+    return this.gameState.tiltShiftEnabled();
+  }
+
+  public toggleTiltShift(): void {
+    this.gameState.tiltShiftEnabled.update((v) => !v);
+    this.gameState.saveSettings();
+  }
+
   public opacityPercent(): number {
     return Math.round(this.gameState.hudOpacity() * 100);
   }
@@ -312,6 +409,17 @@ export class SettingsModalComponent {
     this.gameState.joystickOffsetY.set(next);
     this.gameState.actionOffsetY.set(next);
     this.gameState.saveSettings();
+  }
+
+  public toggleDevEditor(): void {
+    const nextVal = !this.gameState.isDevEditorOpen();
+    this.gameState.isDevEditorOpen.set(nextVal);
+    this.gameState.isSettingsOpen.set(false); // Close settings when entering editor
+    if (nextVal) {
+      this.gameState.showToast('🛠️ Mode Map Editor diaktifkan! Gunakan kuas untuk memahat tanah.');
+    } else {
+      this.gameState.showToast('ℹ️ Mode Map Editor dinonaktifkan.');
+    }
   }
 
   public resetDefaults(): void {
